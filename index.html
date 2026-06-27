@@ -15,6 +15,9 @@ html,body{margin:0;height:100%;background:#000;color:#ccc;font:13px monospace;ov
 <button id="loadcur" title="auto-load the latest file produced by the agent" style="position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:6;background:#222;color:#ccc;border:1px solid #666;border-radius:5px;font:bold 12px monospace;padding:7px 12px;cursor:pointer">⤓ Load Current</button>
 <div id="bar" style="display:none"><button id="play">⏸</button><button id="mute" title="toggle soundtrack">🔊</button><input id="seek" type="range" min="0" max="0" value="0"><span id="fr"></span></div>
 <div id="drop">DROP .GSAV HERE</div>
+<div id="sndHint" style="position:fixed;left:50%;bottom:64px;transform:translateX(-50%);z-index:9;background:#000c;color:#fff;border:1px solid #888;border-radius:22px;font:bold 13px monospace;padding:9px 18px;cursor:pointer;display:none">👆 tap for sound 🔊</div>
+<button id="arBtn" style="position:fixed;left:50%;top:52px;transform:translateX(-50%);z-index:8;background:#0a7a4a;color:#fff;border:1px solid #1c9;border-radius:7px;font:bold 13px monospace;padding:10px 18px;cursor:pointer;display:none">📱 Enter AR</button>
+<div id="arHint" style="position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:10;background:#000c;color:#fff;border:1px solid #888;border-radius:8px;font:bold 13px monospace;padding:9px 16px;display:none">Move your phone to find the floor, then tap to place</div>
 <select id="hdrSel" title="choose environment" style="position:fixed;top:10px;right:120px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 12px monospace;padding:8px 8px;cursor:pointer;max-width:200px"></select>
 <button id="hdrBtn" style="position:fixed;top:10px;right:10px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 13px monospace;padding:8px 12px;cursor:pointer">🌄 HDRi: off</button>
 <div id="fc" style="position:fixed;top:52px;right:10px;background:rgba(0,0,0,0.6);color:#ff0;font:bold 46px monospace;padding:6px 16px;border-radius:8px;display:none"></div>
@@ -43,6 +46,7 @@ const hud=document.getElementById('hud'),drop=document.getElementById('drop');
 const bar=document.getElementById('bar'),seek=document.getElementById('seek'),frEl=document.getElementById('fr'),playBtn=document.getElementById('play');
 let G=null; // {nG,NF,ranges,lumas[],los[],rest,decCache}
 let cur=-1,playing=true;
+let audioStarted=false, inXR=false;   // audio waits for first user gesture (mobile autoplay policy); inXR = WebXR session active
 const _qs=new URLSearchParams(location.search);
 const OPSI=_qs.get('opsi')==='1';                                   // ?opsi=1 = match the the reference page exactly
 const FOVDEG=parseFloat(_qs.get('fov')??(OPSI?45:50));              // the reference uses fov 45
@@ -309,7 +313,10 @@ const SS=parseFloat(_qs.get('ss')??(OPSI?1:Math.max(2,window.devicePixelRatio||2
 const PLAYFPS=parseFloat(new URLSearchParams(location.search).get('fps')||'25');
 const RATE=PLAYFPS/1000;            // frames per ms
 const snd=document.createElement('audio'); snd.preload='auto'; document.body.appendChild(snd);   // optional synced soundtrack
-{const _a=_qs.get('audio'); snd.src=(_a==='none')?'':(_a||'https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/TEST_1306_1350F.mp3');}   // default = TEST_1306 soundtrack from R2 (synced to the frame clock); ?audio=<url> overrides, ?audio=none disables
+{const _a=_qs.get('audio'); const _aurl=(_a==='none')?'':(_a||'https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/TEST_1306_1350F.mp3');   // default = TEST_1306 soundtrack from R2; ?audio=<url> overrides, ?audio=none disables
+ // fetch the whole mp3 into a blob URL so it is FULLY buffered -> seekable to ANY frame instantly (a streamed src only
+ // seeks within the downloaded range, which caused the "scrub offsets the sound / must drag back to start" bug).
+ if(_aurl){ fetch(_aurl).then(r=>r.blob()).then(b=>{ snd.src=URL.createObjectURL(b); snd.load(); }).catch(()=>{ snd.src=_aurl; }); }}
 let CACHE_MAX=64; const AHEAD=24;   // cache window held around the playhead; frames decoded ahead
 let warming=false;                  // true while pre-decoding all frames at load
 const VS=`#version 300 es
@@ -349,7 +356,7 @@ layout(location=0) in vec2 corner;
 layout(location=1) in vec3 ipos; layout(location=2) in vec3 iscl;
 layout(location=3) in vec4 irot; layout(location=4) in float iop;
 layout(location=5) in vec3 icol;
-uniform mat4 view; uniform vec2 focal, vp; uniform float dil;
+uniform mat4 view; uniform vec2 focal, vp; uniform float dil; uniform vec2 pp;  // pp = principal-point offset (ndc); 0 for the orbit cam, set from the XR projection in AR
 out vec2 vPx; out float vOp; out vec3 vCol; out vec4 vConic;
 void main(){
   vec4 tc=view*vec4(ipos,1.0); float tz=tc.z;
@@ -378,7 +385,7 @@ void main(){
   float rad=ceil(3.0*sqrt(lam1));
   vPx=corner*rad; vOp=iop*comp; vCol=icol; vConic=vec4(C2/det,-B2/det,A2/det,0.0);
   vec2 center=vec2(tc.x*focal.x/tz,tc.y*focal.y/tz);
-  vec2 ndc=(center+vPx)/(vp*0.5); ndc.y=-ndc.y;
+  vec2 ndc=(center+vPx)/(vp*0.5); ndc.y=-ndc.y; ndc+=pp;
   gl_Position=vec4(ndc,tz/100.0,1.0);
 }`;
 const FS=`#version 300 es
@@ -579,6 +586,20 @@ cv.onmousedown=e=>{const mv=ev=>{if(e.button===2){tgt[0]-=ev.movementX*0.002;tgt
   addEventListener('mousemove',mv);addEventListener('mouseup',up);};
 cv.oncontextmenu=e=>e.preventDefault();
 addEventListener('wheel',e=>{dist*=Math.exp(e.deltaY*0.001);el=Math.max(ELMIN(),el);});
+// ---- touch: 1-finger drag = orbit (az/el), 2-finger pinch = dolly (dist). Mirrors the mouse/wheel above. ----
+let _tPrev=null,_tPinch=0;   // last single-touch xy / last 2-touch distance
+cv.addEventListener('touchstart',e=>{ e.preventDefault();
+  if(e.touches.length===1){ _tPrev={x:e.touches[0].clientX,y:e.touches[0].clientY}; _tPinch=0; }
+  else if(e.touches.length>=2){ const dx=e.touches[0].clientX-e.touches[1].clientX,dy=e.touches[0].clientY-e.touches[1].clientY; _tPinch=Math.hypot(dx,dy); _tPrev=null; }
+},{passive:false});
+cv.addEventListener('touchmove',e=>{ e.preventDefault();
+  if(e.touches.length===1&&_tPrev){ const t=e.touches[0],ddx=t.clientX-_tPrev.x,ddy=t.clientY-_tPrev.y; _tPrev={x:t.clientX,y:t.clientY};
+    az+=ddx*0.005; el=Math.max(ELMIN(),Math.min(1.4,el+ddy*0.005)); }
+  else if(e.touches.length>=2){ const dx=e.touches[0].clientX-e.touches[1].clientX,dy=e.touches[0].clientY-e.touches[1].clientY,d=Math.hypot(dx,dy);
+    if(_tPinch>0){ dist*=Math.exp((_tPinch-d)*0.006); el=Math.max(ELMIN(),el); } _tPinch=d; }   // spread fingers (d grows) -> zoom in
+},{passive:false});
+cv.addEventListener('touchend',e=>{ if(e.touches.length===0){_tPrev=null;_tPinch=0;}
+  else if(e.touches.length===1){_tPrev={x:e.touches[0].clientX,y:e.touches[0].clientY};_tPinch=0;} },{passive:false});
 
 // preallocated render scratch (grows with n) — no per-frame allocation => no GC hitching during playback
 let SC={n:0};
@@ -591,12 +612,20 @@ const NBITS=parseInt(new URLSearchParams(location.search).get('nb')||'16');const
 const CNTS=new Uint32Array(NBUCK+1);
 function setFrame(f){cur=f;seek.value=f;frEl.textContent=`f${f+1}/${G.NF}`;
   const fc=document.getElementById('fc');fc.style.display='block';fc.textContent=f+1;}
+function syncAudio(){ if(!snd.src)return; try{snd.currentTime=cur/PLAYFPS;}catch(e){} }   // lock the soundtrack to the current frame
 function togglePlay(){playing=!playing;playBtn.textContent=playing?'⏸':'▶';
-  if(playing){playT0=performance.now()-cur/RATE; if(snd.src){snd.currentTime=cur/PLAYFPS; snd.play().catch(()=>{});}}
+  if(playing){playT0=performance.now()-cur/RATE; if(snd.src){audioStarted=true; syncAudio(); snd.play().catch(()=>{}); hideSndHint();}}
   else if(snd.src) snd.pause();}
 playBtn.onclick=()=>{togglePlay();playBtn.blur();};
 {const mb=document.getElementById('mute'); if(mb) mb.onclick=function(){snd.muted=!snd.muted;this.textContent=snd.muted?'🔇':'🔊';this.blur();};}
-seek.oninput=()=>{playing=false;playBtn.textContent='▶';setFrame(+seek.value); if(snd.src){snd.pause();snd.currentTime=(+seek.value)/PLAYFPS;}};
+// scrub: jump BOTH the visual frame AND the soundtrack to the dragged position (blob src => seekable anywhere, no offset)
+seek.oninput=()=>{playing=false;playBtn.textContent='▶';setFrame(+seek.value); if(snd.src){snd.pause();try{snd.currentTime=(+seek.value)/PLAYFPS;}catch(e){}}};
+// mobile blocks audio until a user gesture: the visual auto-plays from frame 0; the FIRST tap/click starts the
+// soundtrack synced to wherever the visual currently is (so it kicks in on-beat instead of from a stale position).
+function hideSndHint(){const h=document.getElementById('sndHint'); if(h)h.style.display='none';}
+function startAudio(){ if(audioStarted||!snd.src)return; audioStarted=true; hideSndHint();
+  if(playing){ syncAudio(); snd.play().catch(()=>{}); } }
+addEventListener('pointerdown',startAudio); addEventListener('keydown',startAudio);
 
 const C0=0.28209479,SHC=[0.48860251,1.09254843,0.31539157,0.54627421,0.59004359,2.89061144,0.45704579,0.37317633,1.44530572];
 const NOSH=new URLSearchParams(location.search).get('nosh')==='1';   // debug: skip SH -> DC-only color
@@ -641,10 +670,18 @@ function shade(d,cx,cy,cz,out){ // CPU SH eval -> col buffer (out = preallocated
 }
 
 let playT0=0,fpsT=0,fpsN=0,fpsShown=0;
+// advance the playhead on the fixed-FPS clock + keep the soundtrack locked to it (called by the normal loop AND the XR loop)
+function advanceFrame(t){
+  if(!(playing&&G&&G.NF>1))return;
+  const nf=Math.floor((t-playT0)*RATE)%G.NF;
+  if(nf!==cur){ if(nf<cur&&snd.src&&audioStarted){try{snd.currentTime=0;}catch(e){} snd.play().catch(()=>{});} setFrame(nf); }   // wrap -> restart soundtrack
+  if(snd.src&&audioStarted&&!snd.paused){ const want=cur/PLAYFPS; if(Math.abs(snd.currentTime-want)>0.15) snd.currentTime=want; }  // drift correction: never let A/V slip
+}
 function loop(t){
   requestAnimationFrame(loop);
   if(!G)return;
-  if(playing&&G.NF>1){const nf=Math.floor((t-playT0)*RATE)%G.NF;if(nf!==cur){if(nf<cur&&snd.src){snd.currentTime=0;snd.play().catch(()=>{});}setFrame(nf);}}
+  advanceFrame(t);
+  if(inXR)return;   // an immersive WebXR session drives its own render loop (onXRFrame)
   const d=G.is4dsl?decode4dsl(cur):decode(cur);
   // fps meter (rendered fps; updates twice/sec)
   fpsN++;if(t-fpsT>500){fpsShown=Math.round(fpsN*1000/(t-fpsT));fpsN=0;fpsT=t;
@@ -676,6 +713,7 @@ function loop(t){
   gl.uniform2f(gl.getUniformLocation(prog,'focal'),fy,fy);
   gl.uniform2f(gl.getUniformLocation(prog,'vp'),cv.width,cv.height);
   gl.uniform1f(gl.getUniformLocation(prog,'dil'),DIL);
+  gl.uniform2f(gl.getUniformLocation(prog,'pp'),0,0);   // orbit cam = centered projection
   gl.uniform1f(gl.getUniformLocation(prog,'falk'),FALK);
   gl.uniform1f(gl.getUniformLocation(prog,'gExp'),GRADE.exp); gl.uniform1f(gl.getUniformLocation(prog,'gTemp'),GRADE.temp);
   gl.uniform1f(gl.getUniformLocation(prog,'gTint'),GRADE.tint); gl.uniform1f(gl.getUniformLocation(prog,'gCon'),GRADE.con);
@@ -802,6 +840,122 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
     await load(buf.buffer);
     if(hud) hud.textContent='';
     if(bar) bar.style.display='flex';
+    // auto-play from the beginning; the soundtrack arms on the first tap so it kicks in synced
+    cur=0; setFrame(0); playing=true; playBtn.textContent='⏸'; playT0=performance.now();
+    if(snd.src&&!audioStarted){const h=document.getElementById('sndHint'); if(h)h.style.display='block';}
   }catch(e){ if(hud) hud.textContent='load failed: '+e.message; console.error('EWA load failed',e); }
+})();
+
+// ============================== WebXR AR (Android Chrome) ==============================
+// Places the volumetric performer on a real floor (hit-test) and renders the same splats from the phone's
+// pose, with a soft contact shadow. iOS Safari has no WebXR -> the button stays hidden (3D fallback only).
+// NOTE: written against the WebXR Device API spec; could not be run on a headset/phone here -> test on-device.
+(function(){
+  const arBtn=document.getElementById('arBtn'), arHint=document.getElementById('arHint');
+  if(!('xr' in navigator)||!navigator.xr){ return; }
+  navigator.xr.isSessionSupported('immersive-ar').then(ok=>{ if(ok&&arBtn) arBtn.style.display='block'; }).catch(()=>{});
+
+  // a flat floor disc with a soft radial dark gradient = contact shadow under the actor
+  const shVS=`#version 300 es
+    layout(location=0) in vec2 corner; uniform mat4 view; uniform vec2 focal,vp,pp; uniform vec3 base; uniform float rad;
+    out vec2 vp2; void main(){ vp2=corner;
+      vec3 wp=base+vec3(corner.x*rad,0.0,corner.y*rad);
+      vec4 tc=view*vec4(wp,1.0); float tz=tc.z; if(tz<0.05){gl_Position=vec4(0,0,2,1);return;}
+      vec2 c=vec2(tc.x*focal.x/tz,tc.y*focal.y/tz); vec2 ndc=c/(vp*0.5); ndc.y=-ndc.y; ndc+=pp;
+      gl_Position=vec4(ndc,tz/100.0,1.0); }`;
+  const shFS=`#version 300 es
+    precision highp float; in vec2 vp2; out vec4 frag;
+    void main(){ float r=length(vp2); float a=smoothstep(1.0,0.0,r)*0.55; frag=vec4(0.0,0.0,0.0,a); }`;
+  const shProg=mkProg(shVS,shFS);
+  const shQuad=new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+  const shVbo=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,shVbo); gl.bufferData(gl.ARRAY_BUFFER,shQuad,gl.STATIC_DRAW);
+
+  let session=null, refSpace=null, hitSource=null, placed=null, lastHit=null;
+  // build the renderer's (+z-forward) view matrix from an XR camera pose, with the model placed at `pl`
+  function viewFromXR(cm, pl){
+    const eyeW=[cm[12],cm[13],cm[14]];
+    const fwd=[-cm[8],-cm[9],-cm[10]], rx=[cm[0],cm[1],cm[2]], up=[cm[4],cm[5],cm[6]];   // camera +x,+y,-z axes
+    const eye=[eyeW[0]-pl[0], eyeW[1]-pl[1], eyeW[2]-pl[2]];                              // model placed at pl => shift the eye
+    return new Float32Array([rx[0],up[0],fwd[0],0, rx[1],up[1],fwd[1],0, rx[2],up[2],fwd[2],0,
+      -(rx[0]*eye[0]+rx[1]*eye[1]+rx[2]*eye[2]),-(up[0]*eye[0]+up[1]*eye[1]+up[2]*eye[2]),-(fwd[0]*eye[0]+fwd[1]*eye[1]+fwd[2]*eye[2]),1]);
+  }
+  // draw the current frame's splats with an arbitrary view/projection (XR). Mirrors loop()'s splat draw.
+  function drawSplatsXR(viewM, eye, fx, fy, ppx, ppy){
+    const d=G.is4dsl?decode4dsl(cur):decode(cur);
+    const n=d.n,S=scratch(n),sortKeys=S.keys,bi=S.bi,idx=S.idx,cnts=CNTS;
+    for(let i=0;i<n;i++)sortKeys[i]=viewM[2]*d.pos[i*3]+viewM[6]*d.pos[i*3+1]+viewM[10]*d.pos[i*3+2];
+    let mn=Infinity,mx=-Infinity; for(let i=0;i<n;i++){const v=sortKeys[i];if(v<mn)mn=v;if(v>mx)mx=v;}
+    const NB=NBUCK,sc=(NB-1)/Math.max(1e-9,mx-mn); cnts.fill(0);
+    for(let i=0;i<n;i++){const bI=NB-1-(((sortKeys[i]-mn)*sc)|0);bi[i]=bI;cnts[bI+1]++;}
+    for(let b=0;b<NB;b++)cnts[b+1]+=cnts[b];
+    for(let i=0;i<n;i++)idx[cnts[bi[i]]++]=i;
+    const col=shade(d,eye[0],eye[1],eye[2],S.col);
+    const put=(name,src,nc,dst)=>{ for(let j=0;j<n;j++){const i=idx[j];for(let k=0;k<nc;k++)dst[j*nc+k]=src[i*nc+k];}
+      gl.bindBuffer(gl.ARRAY_BUFFER,bufs[name]);gl.bufferData(gl.ARRAY_BUFFER,dst.subarray(0,n*nc),gl.DYNAMIC_DRAW);};
+    // contact shadow first (under the actor's XZ centroid), then the splats over it
+    let sx=0,sz=0,cc=0; for(let i=0;i<n;i+=2){if(d.opa[i]<0.25)continue;sx+=d.pos[i*3];sz+=d.pos[i*3+2];cc++;}
+    gl.useProgram(shProg);
+    gl.bindBuffer(gl.ARRAY_BUFFER,shVbo); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+    gl.uniformMatrix4fv(gl.getUniformLocation(shProg,'view'),false,viewM);
+    gl.uniform2f(gl.getUniformLocation(shProg,'focal'),fx,fy);
+    gl.uniform2f(gl.getUniformLocation(shProg,'vp'),gl._w,gl._h); gl.uniform2f(gl.getUniformLocation(shProg,'pp'),ppx,ppy);
+    gl.uniform3f(gl.getUniformLocation(shProg,'base'),cc?sx/cc:0,0,cc?sz/cc:0); gl.uniform1f(gl.getUniformLocation(shProg,'rad'),0.6);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    // splats
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER,qb); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+    put('pos',d.pos,3,S.pos);put('scl',d.scl,3,S.scl);put('rot',d.rot,4,S.rot);put('opa',d.opa,1,S.opa);put('col',col,3,S.pcol);
+    gl.uniformMatrix4fv(gl.getUniformLocation(prog,'view'),false,viewM);
+    gl.uniform2f(gl.getUniformLocation(prog,'focal'),fx,fy);
+    gl.uniform2f(gl.getUniformLocation(prog,'vp'),gl._w,gl._h);
+    gl.uniform1f(gl.getUniformLocation(prog,'dil'),DIL); gl.uniform1f(gl.getUniformLocation(prog,'falk'),FALK);
+    gl.uniform2f(gl.getUniformLocation(prog,'pp'),ppx,ppy);
+    gl.uniform1f(gl.getUniformLocation(prog,'gExp'),GRADE.exp); gl.uniform1f(gl.getUniformLocation(prog,'gTemp'),GRADE.temp);
+    gl.uniform1f(gl.getUniformLocation(prog,'gTint'),GRADE.tint); gl.uniform1f(gl.getUniformLocation(prog,'gCon'),GRADE.con);
+    gl.uniform1f(gl.getUniformLocation(prog,'gSat'),GRADE.sat);
+    gl.uniform1f(gl.getUniformLocation(prog,'gR'),GRADE.r); gl.uniform1f(gl.getUniformLocation(prog,'gG'),GRADE.g); gl.uniform1f(gl.getUniformLocation(prog,'gB'),GRADE.b);
+    gl.uniform1f(gl.getUniformLocation(prog,'gBlk'),GRADE.blk); gl.uniform1f(gl.getUniformLocation(prog,'gWht'),GRADE.wht);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,n);
+  }
+  function onXRFrame(t, frame){
+    if(!session)return;
+    session.requestAnimationFrame(onXRFrame);
+    const pose=frame.getViewerPose(refSpace); if(!pose)return;
+    advanceFrame(t);
+    if(hitSource){ const hits=frame.getHitTestResults(hitSource);
+      if(hits.length){ const hp=hits[0].getPose(refSpace); if(hp){ const p=hp.transform.position; lastHit=[p.x,p.y,p.z]; } } }
+    const layer=session.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,layer.framebuffer);
+    gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);   // transparent -> camera passthrough shows through
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.DEPTH_TEST);
+    if(!G)return;
+    const pl=placed||lastHit||[0,0,-1.5];   // preview 1.5 m ahead until the user taps to place
+    for(const view of pose.views){
+      const vp=layer.getViewport(view); gl.viewport(vp.x,vp.y,vp.width,vp.height); gl._w=vp.width; gl._h=vp.height;
+      const viewM=viewFromXR(view.transform.matrix, pl);
+      const eyeW=view.transform.matrix; const eye=[eyeW[12]-pl[0],eyeW[13]-pl[1],eyeW[14]-pl[2]];
+      const pm=view.projectionMatrix;
+      const fx=vp.width*0.5*pm[0], fy=vp.height*0.5*pm[5], ppx=pm[8], ppy=pm[9];
+      drawSplatsXR(viewM, eye, fx, fy, ppx, ppy);
+    }
+  }
+  async function enterAR(){
+    try{
+      await gl.makeXRCompatible();
+      session=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['local-floor','dom-overlay'],domOverlay:{root:document.body}});
+      inXR=true; placed=null; lastHit=null;
+      session.updateRenderState({baseLayer:new XRWebGLLayer(session,gl)});
+      refSpace=await session.requestReferenceSpace('local-floor').catch(()=>session.requestReferenceSpace('local'));
+      const viewerSpace=await session.requestReferenceSpace('viewer');
+      try{ hitSource=await session.requestHitTestSource({space:viewerSpace}); }catch(e){ hitSource=null; }
+      session.addEventListener('select',()=>{ if(lastHit) placed=lastHit.slice(); if(arHint) arHint.textContent='Placed. Walk around the performer.'; });
+      session.addEventListener('end',()=>{ inXR=false; session=null; hitSource=null; if(arHint)arHint.style.display='none'; if(arBtn)arBtn.style.display='block'; requestAnimationFrame(loop); });
+      if(arBtn) arBtn.style.display='none'; if(arHint) arHint.style.display='block';
+      // arm + sync the soundtrack (entering AR is a user gesture)
+      audioStarted=true; hideSndHint(); if(snd.src){ syncAudio(); snd.play().catch(()=>{}); }
+      session.requestAnimationFrame(onXRFrame);
+    }catch(e){ inXR=false; session=null; console.error('AR session failed',e); if(arHint){arHint.style.display='block';arHint.textContent='AR failed: '+e.message; setTimeout(()=>arHint.style.display='none',4000);} }
+  }
+  if(arBtn) arBtn.onclick=()=>{ enterAR(); arBtn.blur(); };
 })();
 </script></body></html>
