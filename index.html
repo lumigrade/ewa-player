@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<!-- Our own .gsav player. Decode: WebCodecs VP9 (bit-exact luma) + fzstd + exact site math.
+     Render: WebGL2 instanced EWA splatting + full SH deg-3 (CPU-evaluated per view).
+     Run: node serve.js  ->  http://localhost:8123/work/viewer.html  -> drop a .gsav -->
+<html><head><meta charset="utf-8"><title>4DSL Player</title><style>
+html,body{margin:0;height:100%;background:#000;color:#ccc;font:13px monospace;overflow:hidden}
+#cv{width:100vw;height:100vh;display:block}
+#hud{position:fixed;left:10px;top:10px;background:#0008;padding:8px;border-radius:6px}
+#bar{position:fixed;left:10px;right:10px;bottom:10px;display:flex;gap:8px;align-items:center;background:#0008;padding:8px;border-radius:6px}
+#seek{flex:1}button{background:#222;color:#ccc;border:1px solid #555;border-radius:4px;padding:4px 10px}
+#drop{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:22px;color:#888}
+</style></head><body>
+<canvas id="cv"></canvas>
+<div id="hud">drop a .gsav anywhere</div>
+<button id="loadcur" title="auto-load the latest file produced by the agent" style="position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:6;background:#222;color:#ccc;border:1px solid #666;border-radius:5px;font:bold 12px monospace;padding:7px 12px;cursor:pointer">⤓ Load Current</button>
+<div id="bar" style="display:none"><button id="play">⏸</button><button id="mute" title="toggle soundtrack">🔊</button><input id="seek" type="range" min="0" max="0" value="0"><span id="fr"></span></div>
+<div id="drop">DROP .GSAV HERE</div>
+<select id="hdrSel" title="choose environment" style="position:fixed;top:10px;right:120px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 12px monospace;padding:8px 8px;cursor:pointer;max-width:200px"></select>
+<button id="hdrBtn" style="position:fixed;top:10px;right:10px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 13px monospace;padding:8px 12px;cursor:pointer">🌄 HDRi: off</button>
+<div id="fc" style="position:fixed;top:52px;right:10px;background:rgba(0,0,0,0.6);color:#ff0;font:bold 46px monospace;padding:6px 16px;border-radius:8px;display:none"></div>
+<button id="gradeBtn" style="position:fixed;left:10px;bottom:62px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 12px monospace;padding:8px 12px;cursor:pointer">🎨 Grade</button>
+<div id="grade" style="position:fixed;left:10px;bottom:104px;z-index:8;background:#000b;color:#ccc;border:1px solid #777;border-radius:8px;font:11px monospace;padding:10px;display:none;width:210px">
+  <div style="font-weight:bold;margin-bottom:6px">🎨 Color Grade (live → baked)</div>
+  <label>Exposure <span id="gv_exp">0.00</span><input id="gs_exp" type="range" min="-2" max="2" step="0.01" value="0" style="width:100%"></label>
+  <label>Temp <span id="gv_temp">0.00</span><input id="gs_temp" type="range" min="-0.3" max="0.3" step="0.005" value="0" style="width:100%"></label>
+  <label>Tint <span id="gv_tint">0.00</span><input id="gs_tint" type="range" min="-0.3" max="0.3" step="0.005" value="0" style="width:100%"></label>
+  <label>Contrast <span id="gv_con">1.00</span><input id="gs_con" type="range" min="0.5" max="1.8" step="0.01" value="1" style="width:100%"></label>
+  <label>Saturation <span id="gv_sat">1.00</span><input id="gs_sat" type="range" min="0" max="2" step="0.01" value="1" style="width:100%"></label>
+  <label>Black level <span id="gv_blk">0.00</span><input id="gs_blk" type="range" min="-0.2" max="0.3" step="0.005" value="0" style="width:100%"></label>
+  <label>White level <span id="gv_wht">1.00</span><input id="gs_wht" type="range" min="0.6" max="1.4" step="0.005" value="1" style="width:100%"></label>
+  <label>R <span id="gv_r">1.00</span><input id="gs_r" type="range" min="0.5" max="1.5" step="0.005" value="1" style="width:100%"></label>
+  <label>G <span id="gv_g">1.00</span><input id="gs_g" type="range" min="0.5" max="1.5" step="0.005" value="1" style="width:100%"></label>
+  <label>B <span id="gv_b">1.00</span><input id="gs_b" type="range" min="0.5" max="1.5" step="0.005" value="1" style="width:100%"></label>
+  <div style="margin-top:8px;display:flex;gap:6px">
+    <button id="g_reset" style="flex:1;background:#333;color:#ccc;border:1px solid #666;border-radius:4px;cursor:pointer;padding:5px">Reset</button>
+    <button id="g_copy" style="flex:1;background:#2a6;color:#fff;border:1px solid #666;border-radius:4px;cursor:pointer;padding:5px">Bake EWA</button>
+  </div>
+</div>
+<script type="module">
+import { decompress as zstd } from 'https://unpkg.com/fzstd@0.1.1/esm/index.mjs';
+let A=194,W=970,H=582;const SLOTS=14;  // A/W/H now read from gsav header (atlasSide@24,cols@26,rows@27) to support custom atlas sizes (>37636 splats)
+const hud=document.getElementById('hud'),drop=document.getElementById('drop');
+const bar=document.getElementById('bar'),seek=document.getElementById('seek'),frEl=document.getElementById('fr'),playBtn=document.getElementById('play');
+let G=null; // {nG,NF,ranges,lumas[],los[],rest,decCache}
+let cur=-1,playing=true;
+const _qs=new URLSearchParams(location.search);
+const OPSI=_qs.get('opsi')==='1';                                   // ?opsi=1 = match the the reference page exactly
+const FOVDEG=parseFloat(_qs.get('fov')??(OPSI?45:50));              // the reference uses fov 45
+const PLAYER='EWA player (:8123)'+(OPSI?' · the reference-matched':'');// shown next to the file name
+
+function magic(buf,off){const u=new Uint8Array(buf,off,4);return String.fromCharCode(u[0],u[1],u[2],u[3]);}
+async function load(buf){
+  if(magic(buf,4)==='4DSL')return load4dsl(buf);
+  return loadGsav(buf);
+}
+async function loadGsav(buf){
+  const dv=new DataView(buf),u8=new Uint8Array(buf);
+  const nG=dv.getUint32(8,true),NF=dv.getUint32(12,true);
+  const rangesOff=dv.getUint32(32,true),frameIdxOff=dv.getUint32(40,true),mlOff=dv.getUint32(44,true),vidOff=dv.getUint32(48,true);
+  let codec='';for(let i=52;i<68&&u8[i];i++)codec+=String.fromCharCode(u8[i]);
+  const shBands=u8[80],shOff=dv.getUint32(81,true);
+  A=dv.getUint16(24,true)||194;{const COLS=u8[26]||5,ROWS=u8[27]||3;W=A*COLS;H=A*ROWS;}  // dynamic atlas from header
+  const f32=o=>dv.getFloat32(o,true);const vec=(o,n)=>Array.from({length:n},(_,i)=>f32(o+4*i));
+  let o=rangesOff;const R={mMin:vec(o,3),mMax:vec(o+12,3)};o+=24;R.sMin=vec(o,3);R.sMax=vec(o+12,3);o+=24;
+  R.qMin=vec(o,4);R.qMax=vec(o+16,4);o+=32;R.opMin=f32(o);R.opMax=f32(o+4);o+=8;R.hMin=vec(o,3);R.hMax=vec(o+12,3);
+  hud.textContent=`nG=${nG} frames=${NF} codec=${codec} | decoding video...`;
+
+  // ---- video: WebCodecs, store luma planes ----
+  const lumas=new Array(NF);
+  await new Promise((res,rej)=>{
+    let got=0;
+    const dec=new VideoDecoder({output:async f=>{
+      const i=got++;
+      const fmt=f.format||'';
+      if(!(fmt.startsWith('I420')||fmt.startsWith('NV12')))rej('unsupported VideoFrame format '+fmt);
+      const tmp=new Uint8Array(f.allocationSize());
+      const layout=await f.copyTo(tmp);
+      const {offset,stride}=layout[0];   // Y plane (same for I420/NV12)
+      const Yp=new Uint8Array(W*H);
+      for(let r=0;r<H;r++)Yp.set(tmp.subarray(offset+r*stride,offset+r*stride+W),r*W);
+      lumas[i]=Yp;
+      f.close();
+      if(i===NF-1)res();
+    },error:rej});
+    dec.configure({codec:codec,codedWidth:W,codedHeight:H,hardwareAcceleration:'prefer-software'});
+    for(let f=0;f<NF;f++){
+      const off=dv.getUint32(frameIdxOff+f*8,true),szw=dv.getUint32(frameIdxOff+f*8+4,true);
+      const sz=szw&0x7FFFFFFF,key=(f===0)||!!(szw&0x80000000);
+      dec.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:f*33333,data:u8.subarray(vidOff+off,vidOff+off+sz)}));
+    }
+    dec.flush().catch(rej);
+  });
+
+  // ---- meansLo all frames ----
+  hud.textContent='decoding meansLo + SH...';
+  const flags=dv.getUint32(mlOff,true);const los=new Array(NF);
+  let p=mlOff+4;
+  for(let f=0;f<NF;f++){
+    const sz=dv.getUint32(p,true);const raw=zstd(u8.subarray(p+4,p+4+sz));p+=4+sz;
+    let lo;
+    if(flags&0x40000000){const base=raw[0],lut=raw.subarray(1,1+base),pk=raw.subarray(1+base);
+      lo=new Uint8Array(nG*3);const b2=base*base;
+      for(let j=0;j<nG;j++){const v=pk[j];const ix=(v/b2)|0,rem=v-ix*b2,iy=(rem/base)|0;
+        lo[j*3]=lut[ix];lo[j*3+1]=lut[iy];lo[j*3+2]=lut[rem-iy*base];}}
+    else if(flags&0x80000000){lo=new Uint8Array(nG*3);
+      for(let j=0;j<nG;j++){lo[j*3]=raw[j];lo[j*3+1]=raw[nG+j];lo[j*3+2]=raw[2*nG+j];}}
+    else lo=raw;
+    los[f]=lo;
+  }
+
+  // ---- SH payload (constant labels assumed; XOR deltas applied) ----
+  let rest=new Float32Array(nG*45);
+  if(shBands>0&&shOff>0){
+    const sdv=new DataView(buf,shOff);
+    const nC=sdv.getUint16(0,true);const coeffs=45;
+    const cb=new Float32Array(buf.slice(shOff+3,shOff+3+256*4));
+    let q=shOff+3+256*4;const csz=dv.getUint32(q,true);
+    const cbytes=zstd(u8.subarray(q+4,q+4+csz));q+=4+csz;
+    // labels frame 0 (first chunk, first frame)
+    q+=4; // nFramesInChunk
+    const lsz=dv.getUint32(q,true);const lraw=zstd(u8.subarray(q+4,q+4+lsz));
+    const labels=new Uint16Array(lraw.buffer,lraw.byteOffset,nG);
+    for(let i=0;i<nG;i++){const L=labels[i];
+      for(let c=0;c<coeffs;c++)rest[i*45+c]=cb[cbytes[L*coeffs+c]];}
+  }
+  G={is4dsl:false,nG,NF,R,lumas,los,rest,cache:new Map()};
+  seek.max=NF-1;bar.style.display='flex';drop.style.display='none';
+  hud.textContent=`ready: ${nG} splats, ${NF} frames`;
+  cur=-1;setFrame(0);afterLoad();
+}
+
+// ================= .4dsl (deformation-graph format) =================
+async function load4dsl(buf){
+  const dv=new DataView(buf),u8=new Uint8Array(buf);
+  const hdrlen=dv.getUint32(0,true);
+  const NF=dv.getUint32(12,true),N=dv.getUint32(16,true),NN=dv.getUint32(20,true),K=dv.getUint32(24,true);
+  const q=i=>dv.getFloat32(28+4*i,true), q2=i=>dv.getFloat32(92+4*i,true);
+  const PMIN=[q(0),q(1),q(2)],PMAX=[q(3),q(4),q(5)];
+  const SMIN=[q(6),q2(0),q2(1)],SMAX=[q(7),q2(2),q2(3)];
+  const OMIN=q(8),OMAX=q(9);
+  const DMIN=[q(10),q2(4),q2(5)],DMAX=[q(11),q2(6),q2(7)];
+  const TMIN=q(12),TMAX=q(13),DOPMIN=q(14),DOPMAX=q(15),DDCMIN=q2(8),DDCMAX=q2(9);
+  const nSec=dv.getUint32(132,true);const sec={};
+  let p=136;
+  for(let s=0;s<nSec;s++){const tag=String.fromCharCode(u8[p],u8[p+1],u8[p+2],u8[p+3]);
+    const off=dv.getUint32(p+4,true),sz=dv.getUint32(p+8,true);p+=12;
+    sec[tag]=zstd(u8.subarray(hdrlen+off,hdrlen+off+sz));}
+  hud.textContent='decoding .4dsl...';
+  const u16=b=>new Uint16Array(b.buffer,b.byteOffset,b.byteLength>>1);
+  const deqU16=(b,mn,mx,d)=>{const a=u16(b),o=new Float32Array(a.length);
+    for(let i=0;i<a.length;i++){const ch=d?i%d:0;const lo=mn[ch]??mn,hi=mx[ch]??mx;o[i]=a[i]/65535*(hi-lo)+lo;}return o;};
+  const deqU8=(b,mn,mx,d)=>{const o=new Float32Array(b.length);
+    for(let i=0;i<b.length;i++){const ch=d?i%d:0;const lo=mn[ch]??mn,hi=mx[ch]??mx;o[i]=b[i]/255*(hi-lo)+lo;}return o;};
+  // canonical (once)
+  const P0=deqU16(sec['P0__'],PMIN,PMAX,3);
+  const QANC=deqU16(sec['QANC'],-1,1,0);
+  const SCLlog=deqU16(sec['SCAL'],SMIN,SMAX,3);
+  const SCL=new Float32Array(SCLlog.length);for(let i=0;i<SCL.length;i++)SCL[i]=Math.exp(SCLlog[i]); // world scale
+  const OPlogit=deqU16(sec['OPAC'],OMIN,OMAX,0);
+  const DC=deqU16(sec['DCOL'],DMIN,DMAX,3);
+  const SH=sec['SH16']?deqU16(sec['SH16'],-1,1,0):(sec['SH__']?deqU8(sec['SH__'],-1,1,0):null);   // [N*45]; SH16=16-bit (sharp), SH__=legacy 8-bit, null=DC only
+  const G_=deqU16(sec['GPOS'],PMIN,PMAX,3);
+  const SKID=u16(sec['SKID']);          // [N*4]
+  const SKWT=deqU8(sec['SKWT'],0,1,0);  // [N*4]
+  const NODQ=deqU16(sec['NODQ'],-1,1,0);// [NF*NN*4]
+  const NODT=deqU16(sec['NODT'],TMIN,TMAX,0);// [NF*NN*3]
+  const DOP=deqU8(sec['APPO'],DOPMIN,DOPMAX,0);   // [NF*N]
+  const DDC=deqU8(sec['APPD'],DDCMIN,DDCMAX,0);   // [NF*N*3]
+  const FTYP=sec['FTYP'];
+  // block / raw frame tables + data (kept compressed-decoded as float arrays per frame, lazy)
+  function readFrames(hTag,dTag){
+    const h=sec[hTag],hv=new DataView(h.buffer,h.byteOffset,h.byteLength);
+    const nf=hv.getUint32(0,true);const map={};let doff=0;const D=sec[dTag];
+    for(let i=0;i<nf;i++){const fr=hv.getUint32(4+i*8,true),n=hv.getUint32(8+i*8,true);
+      map[fr]={n,off:doff};doff+=n*(3+4+3+1+3)*2;} // u16 per value
+    return {map,D};
+  }
+  const BLK=readFrames('BLKH','BLKD'),RAW=readFrames('RAWH','RAWD');
+  function frameSplats(pack,fr){ // -> {n,pos,rot,scl(world),opa,col}
+    const e=pack.map[fr];if(!e)return null;const n=e.n;const dv2=new DataView(pack.D.buffer,pack.D.byteOffset+e.off);
+    const pos=new Float32Array(n*3),rot=new Float32Array(n*4),scl=new Float32Array(n*3),opa=new Float32Array(n),col=new Float32Array(n*3);
+    let o=0;const rd=()=>{const v=dv2.getUint16(o,true);o+=2;return v/65535;};
+    for(let i=0;i<n*3;i++){const ch=i%3;pos[i]=rd()*(PMAX[ch]-PMIN[ch])+PMIN[ch];}
+    for(let i=0;i<n*4;i++)rot[i]=rd()*2-1;
+    for(let i=0;i<n*3;i++){const ch=i%3;scl[i]=Math.exp(rd()*(SMAX[ch]-SMIN[ch])+SMIN[ch]);}
+    for(let i=0;i<n;i++)opa[i]=1/(1+Math.exp(-(rd()*(OMAX-OMIN)+OMIN)));
+    for(let i=0;i<n*3;i++){const ch=i%3;col[i]=rd()*(DMAX[ch]-DMIN[ch])+DMIN[ch];}
+    return {n,pos,rot,scl,opa,col};
+  }
+  G={is4dsl:true,NF,N,NN,K,P0,QANC,SCL,OPlogit,DC,SH,G_,SKID,SKWT,NODQ,NODT,DOP,DDC,FTYP,BLK,RAW,frameSplats,cache:new Map()};
+  seek.max=NF-1;bar.style.display='flex';drop.style.display='none';
+  hud.textContent=`ready (.4dsl): ${N} splats + graph, ${NF} frames`;
+  cur=-1;setFrame(0);afterLoad();
+}
+
+function quatRot(qw,qx,qy,qz,vx,vy,vz){ // R(q)·v
+  const r0=(1-2*(qy*qy+qz*qz))*vx+2*(qx*qy-qw*qz)*vy+2*(qx*qz+qw*qy)*vz;
+  const r1=2*(qx*qy+qw*qz)*vx+(1-2*(qx*qx+qz*qz))*vy+2*(qy*qz-qw*qx)*vz;
+  const r2=2*(qx*qz-qw*qy)*vx+2*(qy*qz+qw*qx)*vy+(1-2*(qx*qx+qy*qy))*vz;
+  return [r0,r1,r2];
+}
+function decode4dsl(f){
+  if(G.cache.has(f))return G.cache.get(f);
+  const ft=G.FTYP[f];
+  let d;
+  if(ft===2){ // raw window
+    const r=G.frameSplats(G.RAW,f+1); // file frames are 1-based
+    d={n:r.n,pos:r.pos,scl:r.scl,rot:r.rot,opa:r.opa,col:r.col,rest:null,nShaded:0};
+  }else{
+    const {N,NN,P0,QANC,SCL,OPlogit,DC,SH,G_,SKID,SKWT}=G;
+    const nq=G.NODQ.subarray(f*NN*4,(f+1)*NN*4),nt=G.NODT.subarray(f*NN*3,(f+1)*NN*3);
+    const dop=G.DOP.subarray(f*N,(f+1)*N),ddc=G.DDC.subarray(f*N*3,(f+1)*N*3);
+    // per-node normalized quats + centers
+    const nqn=new Float32Array(NN*4),cen=new Float32Array(NN*3);
+    for(let j=0;j<NN;j++){let w=nq[j*4],x=nq[j*4+1],y=nq[j*4+2],z=nq[j*4+3];
+      let L=Math.hypot(w,x,y,z)||1;w/=L;x/=L;y/=L;z/=L;nqn[j*4]=w;nqn[j*4+1]=x;nqn[j*4+2]=y;nqn[j*4+3]=z;
+      cen[j*3]=G_[j*3]+nt[j*3];cen[j*3+1]=G_[j*3+1]+nt[j*3+1];cen[j*3+2]=G_[j*3+2]+nt[j*3+2];}
+    const pos=new Float32Array(N*3),rot=new Float32Array(N*4),opa=new Float32Array(N),col=new Float32Array(N*3);
+    for(let i=0;i<N;i++){
+      const i4=i*4;let px=0,py=0,pz=0,bw=0,bx=0,by=0,bz=0;
+      const n0=SKID[i4];const r0w=nqn[n0*4],r0x=nqn[n0*4+1],r0y=nqn[n0*4+2],r0z=nqn[n0*4+3];
+      for(let k=0;k<4;k++){const node=SKID[i4+k],w=SKWT[i4+k];
+        const qw=nqn[node*4],qx=nqn[node*4+1],qy=nqn[node*4+2],qz=nqn[node*4+3];
+        const relx=P0[i*3]-G_[node*3],rely=P0[i*3+1]-G_[node*3+1],relz=P0[i*3+2]-G_[node*3+2];
+        const rr=quatRot(qw,qx,qy,qz,relx,rely,relz);
+        px+=w*(rr[0]+cen[node*3]);py+=w*(rr[1]+cen[node*3+1]);pz+=w*(rr[2]+cen[node*3+2]);
+        const sgn=(qw*r0w+qx*r0x+qy*r0y+qz*r0z)>=0?w:-w;
+        bw+=sgn*qw;bx+=sgn*qx;by+=sgn*qy;bz+=sgn*qz;}
+      let bl=Math.hypot(bw,bx,by,bz)||1;bw/=bl;bx/=bl;by/=bl;bz/=bl;
+      // rot = quatMul(qb, q_anchor)
+      const aw=QANC[i4],ax=QANC[i4+1],ay=QANC[i4+2],az=QANC[i4+3];
+      rot[i4]=bw*aw-bx*ax-by*ay-bz*az;
+      rot[i4+1]=bw*ax+bx*aw+by*az-bz*ay;
+      rot[i4+2]=bw*ay-bx*az+by*aw+bz*ax;
+      rot[i4+3]=bw*az+bx*ay-by*ax+bz*aw;
+      pos[i*3]=px;pos[i*3+1]=py;pos[i*3+2]=pz;
+      opa[i]=1/(1+Math.exp(-(OPlogit[i]+dop[i])));
+      col[i*3]=DC[i*3]+ddc[i*3];col[i*3+1]=DC[i*3+1]+ddc[i*3+1];col[i*3+2]=DC[i*3+2]+ddc[i*3+2];
+    }
+    if(ft===1){ // append block
+      const b=G.frameSplats(G.BLK,f+1);const n=N+b.n;
+      const P=new Float32Array(n*3),Rt=new Float32Array(n*4),Sc=new Float32Array(n*3),Op=new Float32Array(n),Co=new Float32Array(n*3);
+      P.set(pos);Rt.set(rot);Sc.set(SCL);Op.set(opa);Co.set(col);
+      P.set(b.pos,N*3);Rt.set(b.rot,N*4);Sc.set(b.scl,N*3);Op.set(b.opa,N);Co.set(b.col,N*3);
+      d={n,pos:P,scl:Sc,rot:Rt,opa:Op,col:Co,rest:SH,nShaded:N};
+    }else{
+      d={n:N,pos,scl:SCL,rot,opa,col,rest:SH,nShaded:N};
+    }
+  }
+  // z180: PLY-native (y-down) -> render space, matching encode_v2 TX=z180
+  const P=d.pos,Rt=d.rot;
+  for(let i=0;i<d.n;i++){
+    P[i*3]=-P[i*3];P[i*3+1]=-P[i*3+1];
+    const w=Rt[i*4],x=Rt[i*4+1],y=Rt[i*4+2],z=Rt[i*4+3];
+    Rt[i*4]=-z;Rt[i*4+1]=-y;Rt[i*4+2]=x;Rt[i*4+3]=w;}
+  evict();
+  G.cache.set(f,d);return d;
+}
+
+// ---- per-frame attribute decode (exact site math) ----
+function decode(f){
+  if(G.cache.has(f))return G.cache.get(f);
+  const {nG,R}=G,Y=G.lumas[f],lo=G.los[f];
+  const pos=new Float32Array(nG*3),scl=new Float32Array(nG*3),rot=new Float32Array(nG*4),
+        opa=new Float32Array(nG),col=new Float32Array(nG*3);
+  const st=l=>Math.max(0,Math.min(1,(l-16)/219));
+  const lum=(s,i)=>Y[(((s/5)|0)*A+((i/A)|0))*W+(s%5)*A+(i%A)];
+  const lp=(p,a,b)=>p*(b-a)+a,HP=Math.PI/2;
+  for(let i=0;i<nG;i++){
+    const p=s=>st(lum(s,i));
+    for(let k=0;k<3;k++){const hi=Math.round(p(k)*219);const O=hi*256+lo[i*3+k];
+      const n=lp(O/56319,R.mMin[k],R.mMax[k]);pos[i*3+k]=Math.sign(n)*(Math.exp(Math.abs(n))-1);}
+    for(let k=0;k<3;k++)scl[i*3+k]=Math.exp(lp(p(3+k),R.sMin[k],R.sMax[k]));
+    let qw=0;for(let k=0;k<4;k++){const v=Math.sin(lp(p(6+k),R.qMin[k],R.qMax[k])*HP);rot[i*4+k]=v;qw+=v*v;}
+    qw=Math.sqrt(qw)||1;for(let k=0;k<4;k++)rot[i*4+k]/=qw;
+    opa[i]=1/(1+Math.exp(-lp(p(10),R.opMin,R.opMax)));
+    const Yc=lp(p(11),R.hMin[0],R.hMax[0]),Cb=lp(p(12),R.hMin[1],R.hMax[1]),Cr=lp(p(13),R.hMin[2],R.hMax[2]);
+    col[i*3]=Yc+1.402*Cr;col[i*3+1]=Yc-0.344*Cb-0.714*Cr;col[i*3+2]=Yc+1.772*Cb;
+  }
+  const d={pos,scl,rot,opa,col,n:nG,nShaded:nG,rest:G.rest};
+  evict();
+  G.cache.set(f,d);return d;
+}
+// keep a window of frames near the playhead (evict the farthest); decode upcoming frames ahead of play
+function evict(){if(!G||G.cache.size<=CACHE_MAX)return;
+  let far=-1,fd=-1;for(const k of G.cache.keys()){const dd=Math.min((k-cur+G.NF)%G.NF,(cur-k+G.NF)%G.NF);if(dd>fd){fd=dd;far=k;}}
+  if(far>=0)G.cache.delete(far);}
+const decodeAny=f=>G.is4dsl?decode4dsl(f):decode(f);
+function pump(t){ // decode a couple of upcoming frames per tick when there is idle budget
+  if(!G||!playing||warming||G.NF<2)return;
+  let budget=2;
+  for(let k=1;k<=AHEAD&&budget>0;k++){const f=(cur+k)%G.NF;if(!G.cache.has(f)){decodeAny(f);budget--;}}
+}
+// after load: if the whole sequence fits the cache budget, pre-decode every frame (smooth, decode-free
+// playback); otherwise fall back to the rolling window. Budget ~ 16M splat-frames (e.g. 180*~80k).
+function afterLoad(){const N=G.nG||G.N;CACHE_MAX=(G.NF*N<=16e6)?G.NF:64;
+  if(CACHE_MAX>=G.NF&&G.NF>1)warmup();}
+async function warmup(){warming=true;playing=false;playBtn.textContent='▶';
+  for(let f=0;f<G.NF;f++){if(!G.cache.has(f))decodeAny(f);
+    if(f%6===0){hud.textContent=`warming up ${f}/${G.NF} (decode-free playback)…`;await new Promise(r=>setTimeout(r,0));}}
+  warming=false;playing=true;playBtn.textContent='⏸';playT0=performance.now();}
+
+// ---- WebGL2 splatting ----
+const cv=document.getElementById('cv'),gl=cv.getContext('webgl2',{antialias:true,premultipliedAlpha:false});
+// supersample factor: ?ss=2 renders the backbuffer 2x then the browser downscales (sharper
+// texture, like the site's pixel-ratio + MSAA). default = devicePixelRatio.
+const SS=parseFloat(_qs.get('ss')??(OPSI?1:Math.max(2,window.devicePixelRatio||2)));  // the reference renders ~1x (no supersample)
+// smooth playback: fixed FPS clock + background pre-decode (decode off the hot path -> render only sorts+uploads)
+const PLAYFPS=parseFloat(new URLSearchParams(location.search).get('fps')||'25');
+const RATE=PLAYFPS/1000;            // frames per ms
+const snd=document.createElement('audio'); snd.preload='auto'; document.body.appendChild(snd);   // optional synced soundtrack
+{const _a=_qs.get('audio'); snd.src=(_a==='none')?'':(_a||'https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/TEST_1306_1350F.mp3');}   // default = TEST_1306 soundtrack from R2 (synced to the frame clock); ?audio=<url> overrides, ?audio=none disables
+let CACHE_MAX=64; const AHEAD=24;   // cache window held around the playhead; frames decoded ahead
+let warming=false;                  // true while pre-decoding all frames at load
+const VS=`#version 300 es
+layout(location=0) in vec2 corner;
+layout(location=1) in vec3 ipos; layout(location=2) in vec3 iscl;
+layout(location=3) in vec4 irot; layout(location=4) in float iop;
+layout(location=5) in vec3 icol;
+uniform mat4 view; uniform vec2 focal, vp;
+out vec2 vUV; out float vOp; out vec3 vCol;
+void main(){
+  vec4 tc=view*vec4(ipos,1.0); float tz=tc.z;
+  if(tz<0.2){gl_Position=vec4(0,0,2,1);return;}
+  float w=irot.x,x=irot.y,y=irot.z,z=irot.w;
+  mat3 Rq=mat3(1.-2.*(y*y+z*z),2.*(x*y+w*z),2.*(x*z-w*y),
+               2.*(x*y-w*z),1.-2.*(x*x+z*z),2.*(y*z+w*x),
+               2.*(x*z+w*y),2.*(y*z-w*x),1.-2.*(x*x+y*y));
+  mat3 S=mat3(iscl.x,0,0,0,iscl.y,0,0,0,iscl.z);
+  mat3 M=Rq*S; mat3 V3=mat3(view); mat3 cov3=V3*M*transpose(M)*transpose(V3);
+  vec2 f=focal; mat3 J=mat3(f.x/tz,0,0, 0,f.y/tz,0, -f.x*tc.x/(tz*tz),-f.y*tc.y/(tz*tz),0);
+  mat3 c2=transpose(J)*cov3*J;
+  float a=c2[0][0]+0.3,b2=c2[0][1],c=c2[1][1]+0.3;
+  float det=a*c-b2*b2; if(det<=0.0){gl_Position=vec4(0,0,2,1);return;}
+  float mid=0.5*(a+c),r=sqrt(max(0.01,mid*mid-det));
+  float rad=ceil(3.0*sqrt(max(mid+r,mid-r)));
+  vec2 px=corner*rad;
+  vUV=px; vOp=iop; vCol=icol;
+  mat2 inv=mat2(c,-b2,-b2,a)/det; // conic
+  vec2 ndc=vec2(tc.x*f.x/tz,tc.y*f.y/tz)/(vp*0.5);
+  gl_Position=vec4(ndc+px/(vp*0.5)*vec2(1,-1)*0.0+vec2(px.x*2.0/vp.x,-px.y*2.0/vp.y),0.0,1.0);
+  gl_Position.xy+=ndc; gl_Position.zw=vec2(tz/100.0,1.0);
+  vConic=inv;
+}
+out mat2 vConic;`;
+// note: GLSL requires outs declared before use -> assemble properly below
+const VS2=`#version 300 es
+layout(location=0) in vec2 corner;
+layout(location=1) in vec3 ipos; layout(location=2) in vec3 iscl;
+layout(location=3) in vec4 irot; layout(location=4) in float iop;
+layout(location=5) in vec3 icol;
+uniform mat4 view; uniform vec2 focal, vp; uniform float dil;
+out vec2 vPx; out float vOp; out vec3 vCol; out vec4 vConic;
+void main(){
+  vec4 tc=view*vec4(ipos,1.0); float tz=tc.z;
+  if(tz<0.2){gl_Position=vec4(0,0,2,1);return;}
+  float w=irot.x,x=irot.y,y=irot.z,z=irot.w;
+  mat3 Rq=mat3(1.-2.*(y*y+z*z),2.*(x*y+w*z),2.*(x*z-w*y),
+               2.*(x*y-w*z),1.-2.*(x*x+z*z),2.*(y*z+w*x),
+               2.*(x*z+w*y),2.*(y*z-w*x),1.-2.*(x*x+y*y));
+  mat3 S=mat3(iscl.x,0,0,0,iscl.y,0,0,0,iscl.z);
+  mat3 M=Rq*S; mat3 V3=mat3(view); mat3 cov3=V3*M*transpose(M)*transpose(V3);
+  mat3 J=mat3(focal.x/tz,0,0, 0,focal.y/tz,0, -focal.x*tc.x/(tz*tz),-focal.y*tc.y/(tz*tz),0);
+  mat3 c2m=transpose(J)*cov3*J;
+  float a0=c2m[0][0],b2=c2m[0][1],c0=c2m[1][1];
+  float a=a0+dil,c=c0+dil;
+  float det0=a0*c0-b2*b2;
+  // PlayCanvas/the reference: clamp the MINOR 2D eigenvalue (lambda2 >= 0.1) so edge-on flat surfels keep
+  // a minimum width and cover the surface (instead of becoming zero-width streaks/gaps). Rebuild conic.
+  float mid=0.5*(a+c),r=sqrt(max(1e-6,mid*mid-(a*c-b2*b2)));
+  float lam1=mid+r, lam2=max(mid-r,0.1);
+  vec2 dir=(abs(b2)<1e-7&&a>=c)?vec2(1.0,0.0):normalize(vec2(b2,lam1-a));
+  float dx=dir.x,dy=dir.y;
+  float A2=lam1*dx*dx+lam2*dy*dy, B2=(lam1-lam2)*dx*dy, C2=lam1*dy*dy+lam2*dx*dx;
+  float det=A2*C2-B2*B2;
+  if(det<=0.0){gl_Position=vec4(0,0,2,1);return;}
+  float comp=sqrt(max(0.0,det0/det));   // dilation/AA opacity compensation
+  float rad=ceil(3.0*sqrt(lam1));
+  vPx=corner*rad; vOp=iop*comp; vCol=icol; vConic=vec4(C2/det,-B2/det,A2/det,0.0);
+  vec2 center=vec2(tc.x*focal.x/tz,tc.y*focal.y/tz);
+  vec2 ndc=(center+vPx)/(vp*0.5); ndc.y=-ndc.y;
+  gl_Position=vec4(ndc,tz/100.0,1.0);
+}`;
+const FS=`#version 300 es
+precision highp float;
+in vec2 vPx; in float vOp; in vec3 vCol; in vec4 vConic;
+uniform float falk;   // falloff sharpness: 1.0 = true gaussian (soft, good for our thin splats);
+uniform float gExp, gTemp, gTint, gCon, gSat, gR, gG, gB, gBlk, gWht;  // COLOR GRADE (identity defaults); baked by pack_ewa.py
+out vec4 frag;        // ~4.0 = the reference/PlayCanvas sharpness (good for body_180's big round surfels). ?falk=
+vec3 grade(vec3 c){
+  c *= exp2(gExp);                              // exposure (stops)
+  c *= vec3(1.0+gTemp, 1.0, 1.0-gTemp);         // temperature (warm <-> cool)
+  c *= vec3(1.0-gTint, 1.0+gTint, 1.0-gTint);   // tint (magenta <-> green)
+  c *= vec3(gR, gG, gB);                         // per-channel RGB gain
+  c = (c - gBlk) / max(gWht - gBlk, 0.01);       // black / white levels
+  c = (c-0.5)*gCon + 0.5;                        // contrast about mid-grey
+  float l = dot(c, vec3(0.2126,0.7152,0.0722));
+  return mix(vec3(l), c, gSat);                  // saturation
+}
+void main(){
+  float A=0.5*(vConic.x*vPx.x*vPx.x+vConic.z*vPx.y*vPx.y)+vConic.y*vPx.x*vPx.y;
+  float al=vOp*exp(-falk*A); if(al<0.0039)discard;
+  frag=vec4(grade(vCol)*al,al);
+}`;
+function mkProg(vs,fs){const p=gl.createProgram();
+  for(const[t,s]of[[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){
+    const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(sh);
+    gl.attachShader(p,sh);}
+  gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw gl.getProgramInfoLog(p);
+  return p;}
+const prog=mkProg(VS2,FS);gl.useProgram(prog);
+const quad=new Float32Array([-1,-1,1,-1,-1,1,1,1]);
+const qb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,qb);gl.bufferData(gl.ARRAY_BUFFER,quad,gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+const bufs={};
+for(const[loc,name,nc]of[[1,'pos',3],[2,'scl',3],[3,'rot',4],[4,'opa',1],[5,'col',3]]){
+  bufs[name]=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,bufs[name]);
+  gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,nc,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(loc,1);}
+gl.enable(gl.BLEND);gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.disable(gl.DEPTH_TEST);
+
+// ---- HDRi GROUND-PROJECTED environment (finite dome + ground plane => parallax on zoom, actor lands on the HDRi ground) ----
+// Technique = the "grounded skybox" / GroundProjectedEnv: ray-intersect a sphere(radius) for far scenery and a
+// ground disk at world y=0 for the lower hemisphere, so the floor of the HDRi spreads under the actor and reframes
+// with camera dolly (an infinite backdrop can't do either). Capture point = (0,capH,0) above the actor's feet.
+let HDRON=_qs.get('hdr')==='1', hdrTex=null, HDREXPO=parseFloat(_qs.get('hdrexpo')??'1.8'), HDRYAW=parseFloat(_qs.get('hdryaw')??'0');
+let HDRRAD=parseFloat(_qs.get('hdrrad')??'200'), HDRCAPH=parseFloat(_qs.get('hdrh')??'1.5');   // dome radius (m, matches PlayCanvas SKYTYPE_DOME scale 200) + capture height above ground (m). Too small => horizon-seam + actor floats.
+gl.getExtension('OES_texture_float_linear');   // smooth filtering of the float HDR texture (desktop)
+const bgProg=mkProg(
+ `#version 300 es
+  layout(location=0) in vec2 corner; out vec2 vndc;
+  void main(){ vndc=corner; gl_Position=vec4(corner,0.0,1.0); }`,
+ `#version 300 es
+  precision highp float; in vec2 vndc; out vec4 frag;
+  uniform mat3 invR; uniform vec3 camPos,envC; uniform float aspect,thf,expo,yaw,radius,capH,dbg; uniform sampler2D hdr;
+  uniform sampler2D shadowTex; uniform vec3 shadowC; uniform float shadowK,shadowFR;  // shape-aware ground shadow: top-down actor footprint, region half-size (m)
+  vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }  // ACES filmic tonemap: compress HDR range to display
+  float sphInt(vec3 ro,vec3 rd,float R){ float b=dot(ro,rd),c=dot(ro,ro)-R*R,h=b*b-c; if(h<0.0)return 1e9; return -b+sqrt(h); }
+  float diskInt(vec3 ro,vec3 rd,float yP,float R){ if(rd.y>=-1e-6)return 1e9; float t=(yP-ro.y)/rd.y; if(t<0.0)return 1e9;
+    vec3 p=ro+t*rd; if(p.x*p.x+p.z*p.z>R*R)return 1e9; return t; }
+  void main(){
+    if(dbg>0.5){ frag=vec4(texture(hdr,vec2(vndc.x*0.5+0.5,0.5-vndc.y*0.5)).rgb,1.0); return; }  // ?envdbg=1: raw equirect, flat
+    vec3 rc=normalize(vec3(vndc.x*aspect*thf, vndc.y*thf, 1.0));
+    vec3 rd=normalize(invR*rc);
+    // INFINITE sky: every ray maps to the equirect by its DIRECTION => a full 360 globe that always fills the view
+    // (the old finite-sphere anchor collapsed to "squeezed chunks" whenever the camera left the small dome).
+    vec3 dir=rd;
+    float shadow=0.0;
+    if(rd.y<-1e-4){                                // downward ray -> hits the ground plane at the feet
+      float tg=(envC.y-camPos.y)/rd.y; vec2 hw=(camPos+rd*tg).xz, d2=hw-envC.xz;
+      if(dot(d2,d2)<radius*radius) dir=normalize(vec3(d2.x,-capH,d2.y));  // within the dome: GROUND-PROJECTED floor (grounding + parallax)
+      if(shadowFR>0.0){ vec2 suv=(hw-shadowC.xz)/(2.0*shadowFR)+0.5;       // shape-aware shadow on that floor
+        if(suv.x>0.0&&suv.x<1.0&&suv.y>0.0&&suv.y<1.0) shadow=shadowK*texture(shadowTex,suv).r; } }
+    float u=atan(dir.z,dir.x)*0.1591549+0.5+yaw, v=acos(clamp(dir.y,-1.0,1.0))*0.3183099;  // v: dir.y=+1 (up)->0 (sky top), -1 (down)->1 (ground bottom)
+    vec3 c=texture(hdr,vec2(u,v)).rgb;             // already display-ready (HDR was tonemapped to RGBA8 at load)
+    frag=vec4(c*(1.0-shadow),1.0); }`);
+const uBg={invR:gl.getUniformLocation(bgProg,'invR'),camPos:gl.getUniformLocation(bgProg,'camPos'),aspect:gl.getUniformLocation(bgProg,'aspect'),thf:gl.getUniformLocation(bgProg,'thf'),expo:gl.getUniformLocation(bgProg,'expo'),yaw:gl.getUniformLocation(bgProg,'yaw'),radius:gl.getUniformLocation(bgProg,'radius'),capH:gl.getUniformLocation(bgProg,'capH'),hdr:gl.getUniformLocation(bgProg,'hdr'),shadowC:gl.getUniformLocation(bgProg,'shadowC'),shadowK:gl.getUniformLocation(bgProg,'shadowK'),shadowFR:gl.getUniformLocation(bgProg,'shadowFR'),shadowTex:gl.getUniformLocation(bgProg,'shadowTex'),envC:gl.getUniformLocation(bgProg,'envC'),dbg:gl.getUniformLocation(bgProg,'dbg')};
+const ENVDBG=_qs.get('envdbg')==='1'?1:0;
+// shape-aware shadow: a top-down footprint texture of the actor, rebuilt each frame on CPU (blurred) and sampled by the ground ray
+const SHADN=parseInt(_qs.get('shadn')??'96'); let SHADFR=parseFloat(_qs.get('shadfr')??'1.4');  // grid res, region half-size (m)
+const shadGrid=new Float32Array(SHADN*SHADN), shadTmp=new Float32Array(SHADN*SHADN), shadPix=new Uint8Array(SHADN*SHADN);
+const shadTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,shadTex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.LUMINANCE,SHADN,SHADN,0,gl.LUMINANCE,gl.UNSIGNED_BYTE,shadPix);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+function buildShadow(d,n,cxz){                          // accumulate opaque-splat XZ into the footprint grid, blur, upload
+  shadGrid.fill(0); const FR=SHADFR, inv=(SHADN-1)/(2*FR);
+  for(let i=0;i<n;i++){ if(d.opa[i]<0.25)continue;
+    const gx=(d.pos[i*3]-cxz[0]+FR)*inv, gz=(d.pos[i*3+2]-cxz[1]+FR)*inv;
+    if(gx<0||gx>=SHADN||gz<0||gz>=SHADN)continue;
+    shadGrid[(gz|0)*SHADN+(gx|0)]+=d.opa[i]; }
+  let mx=0; for(let i=0;i<shadGrid.length;i++)if(shadGrid[i]>mx)mx=shadGrid[i]; if(mx<=0){SHADHAS=false;return;} SHADHAS=true;
+  const norm=1/mx; for(let i=0;i<shadGrid.length;i++)shadGrid[i]=Math.min(1,shadGrid[i]*norm*3.0);  // soft-saturate so the body reads as a solid blob
+  for(let pass=0;pass<2;pass++){                        // separable box blur (soft contact penumbra)
+    for(let y=0;y<SHADN;y++)for(let x=0;x<SHADN;x++){let s=0,c=0;for(let k=-2;k<=2;k++){const xx=x+k;if(xx>=0&&xx<SHADN){s+=shadGrid[y*SHADN+xx];c++;}}shadTmp[y*SHADN+x]=s/c;}
+    for(let y=0;y<SHADN;y++)for(let x=0;x<SHADN;x++){let s=0,c=0;for(let k=-2;k<=2;k++){const yy=y+k;if(yy>=0&&yy<SHADN){s+=shadTmp[yy*SHADN+x];c++;}}shadGrid[y*SHADN+x]=s/c;}
+  }
+  for(let i=0;i<shadGrid.length;i++)shadPix[i]=Math.min(255,shadGrid[i]*255)|0;
+  gl.bindTexture(gl.TEXTURE_2D,shadTex); gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,SHADN,SHADN,gl.LUMINANCE,gl.UNSIGNED_BYTE,shadPix);
+}
+let SHADHAS=false;
+let HDRSHADOW=parseFloat(_qs.get('hdrshadow')??'0.45'), HDRSHSIG=parseFloat(_qs.get('hdrshsig')??'0.55');  // contact-shadow strength + radius (m)
+let GROUNDY=parseFloat(_qs.get('groundy')??'0');   // ground/feet plane the HDRi world is anchored to
+// environment relight: tint the actor toward the HDRi's average colour so it blends with the lighting
+let RELIGHT=parseFloat(_qs.get('relight')??'0.5'); let ENVTINT=[1,1,1];   // ENVTINT computed from each HDRi on load
+let ENVSH=new Float32Array(27), ENVHASSH=false;   // L2 SH9 irradiance (RGB) of the HDRi -> per-splat IBL relight (Gracia-style)
+let ENVEXP=1.0;   // auto-exposure key computed per HDRi (handles the huge dynamic range so it displays instead of reading black)
+const HDRSEL=_qs.get('hdrsel');   // optional URL override of which environment to load
+const HDRBASE=(location.port==='8124'?'/hdri/':new URL('hdri/',location.href).href);   // hdri/ co-located with the viewer -> resolves on any server root
+// Radiance .hdr (RGBE) parser -> Float32 RGBA (true high-res HDR; lets expo work on linear radiance, no JPG clipping)
+function parseHDR(buf){const d=new Uint8Array(buf);let p=0;
+  const line=()=>{let s='';while(p<d.length){const c=d[p++];if(c===10)break;s+=String.fromCharCode(c);}return s;};
+  line();                                            // '#?RADIANCE'
+  while(p<d.length){if(line()==='')break;}           // skip header until blank line
+  const m=line().match(/-Y\s+(\d+)\s+\+X\s+(\d+)/);  // resolution
+  const h=+m[1],w=+m[2],img=new Float32Array(w*h*4),scan=new Uint8Array(w*4);
+  for(let y=0;y<h;y++){
+    const a=d[p],b=d[p+1],c=(d[p+2]<<8)|d[p+3];
+    if(a===2&&b===2&&c===w){p+=4;                    // new-style RLE, per channel
+      for(let ch=0;ch<4;ch++){let x=0;while(x<w){let cnt=d[p++];
+        if(cnt>128){const val=d[p++];cnt-=128;while(cnt-->0)scan[(x++)*4+ch]=val;}
+        else{while(cnt-->0)scan[(x++)*4+ch]=d[p++];}}}
+    }else{for(let x=0;x<w;x++){scan[x*4]=d[p++];scan[x*4+1]=d[p++];scan[x*4+2]=d[p++];scan[x*4+3]=d[p++];}}
+    for(let x=0;x<w;x++){const e=scan[x*4+3],f=e?Math.pow(2,e-136):0,o=(y*w+x)*4;
+      img[o]=scan[x*4]*f;img[o+1]=scan[x*4+1]*f;img[o+2]=scan[x*4+2]*f;img[o+3]=1.0;}}
+  return {w,h,data:img};}
+function acesCh(x){const y=(x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14);return y<0?0:y>1?1:y;}
+function hdrToLDR(img,w,h,exp,tw,th){                 // box-downsample float HDR to tw x th + ACES tonemap -> display-ready RGBA8
+  const out=new Uint8Array(tw*th*4), sx=w/tw, sy=h/th;
+  for(let ty=0;ty<th;ty++){const y0=(ty*sy)|0,y1=Math.max(y0+1,((ty+1)*sy)|0);
+    for(let tx=0;tx<tw;tx++){const x0=(tx*sx)|0,x1=Math.max(x0+1,((tx+1)*sx)|0);
+      let r=0,g=0,b=0,c=0; for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){const o=(y*w+x)*4;r+=img[o];g+=img[o+1];b+=img[o+2];c++;}
+      const o=(ty*tw+tx)*4; r/=c;g/=c;b/=c;
+      out[o]=acesCh(r*exp)*255;out[o+1]=acesCh(g*exp)*255;out[o+2]=acesCh(b*exp)*255;out[o+3]=255;}}
+  return out;}
+const FLOATLIN=gl.getExtension('OES_texture_float_linear')||gl.getExtension('OES_texture_half_float_linear');  // LINEAR filtering of float textures needs this ext; else fall back to NEAREST (sharp, but no smeared garbage)
+console.log('float-linear ext:',!!FLOATLIN);
+function uploadTex(setup,isFloat){if(!hdrTex)hdrTex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,hdrTex);setup();
+  const filt=(isFloat&&!FLOATLIN)?gl.NEAREST:gl.LINEAR;
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filt);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filt);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);}
+function computeTint(img,w,h){                        // project the HDRi to L2 SH9 irradiance (RGB) for IBL relight,
+  // and keep an average tint as a fallback. Direction convention matches the bg shader (v=acos(-dir.y), u=atan2(z,x)).
+  const sh=new Float32Array(27); let r=0,g=0,b=0,nn=0,wsum=0,logsum=0; const st=4;
+  for(let y=0;y<h;y+=st){
+    const v=(y+0.5)/h, theta=v*Math.PI, ny=Math.cos(theta), sinT=Math.sin(theta);  // match the shader: v=0 (top)->ny=+1 (up)
+    for(let x=0;x<w;x+=st){
+      const u=(x+0.5)/w, phi=(u-0.5)*2*Math.PI, nx=sinT*Math.cos(phi), nz=sinT*Math.sin(phi);
+      const o=(y*w+x)*4, cr=img[o],cg=img[o+1],cb=img[o+2];
+      r+=cr;g+=cg;b+=cb;nn++;
+      logsum+=Math.log(0.2126*cr+0.7152*cg+0.0722*cb+1e-4);  // log-mean luminance (robust to the sun outlier) -> auto-exposure key
+      const Y=[0.282095, -0.488603*ny, 0.488603*nz, -0.488603*nx,
+        1.092548*nx*ny, -1.092548*ny*nz, 0.315392*(3*nz*nz-1), -1.092548*nx*nz, 0.546274*(nx*nx-ny*ny)];
+      const wt=sinT; wsum+=wt;
+      for(let k=0;k<9;k++){sh[k*3]+=cr*Y[k]*wt;sh[k*3+1]+=cg*Y[k]*wt;sh[k*3+2]+=cb*Y[k]*wt;}
+    }
+  }
+  const A=[3.141593,2.094395,2.094395,2.094395,0.785398,0.785398,0.785398,0.785398,0.785398]; // cosine-lobe: pi,2pi/3,pi/4
+  for(let k=0;k<9;k++)for(let c=0;c<3;c++)ENVSH[k*3+c]=A[k]*sh[k*3+c]/(wsum||1); ENVHASSH=true;
+  r/=nn;g/=nn;b/=nn; const lum=0.2126*r+0.7152*g+0.0722*b||1e-6;
+  const cl=val=>Math.max(0.6,Math.min(1.6,val));
+  ENVTINT=[cl(r/lum),cl(g/lum),cl(b/lum)];
+  const geom=Math.exp(logsum/nn); ENVEXP=Math.max(0.02,Math.min(400,0.18/geom));  // auto-exposure: map log-mean luminance to mid-gray
+  console.log('envSH DC',ENVSH[0].toFixed(2),'autoExp',ENVEXP.toFixed(1),'geomLum',geom.toFixed(4),'tint',ENVTINT.map(v=>v.toFixed(2)).join(','));}
+let HDRLIST=[];   // manifest entries; each may carry tuned {capH,expo,yaw,rad,shadow} overrides
+const _urlHas={h:_qs.has('hdrh'),expo:_qs.has('hdrexpo'),yaw:_qs.has('hdryaw'),rad:_qs.has('hdrrad'),sh:_qs.has('hdrshadow')};
+function applyEnvParams(file){                        // per-HDRi tuning from list.json (URL params still win, for testing)
+  const e=HDRLIST.find(h=>h.file===file)||{};
+  if(e.capH!=null&&!_urlHas.h)HDRCAPH=e.capH; if(e.expo!=null&&!_urlHas.expo)HDREXPO=e.expo;
+  if(e.yaw!=null&&!_urlHas.yaw)HDRYAW=e.yaw; if(e.rad!=null&&!_urlHas.rad)HDRRAD=e.rad;
+  if(e.shadow!=null&&!_urlHas.sh)HDRSHADOW=e.shadow;}
+function loadHdri(file){
+  applyEnvParams(file);
+  if(/\.hdr$/i.test(file)){                          // native HDR: full-res float, no lossy compression
+    fetch(HDRBASE+file).then(r=>r.arrayBuffer()).then(buf=>{const im=parseHDR(buf);
+      computeTint(im.data,im.w,im.h);               // computes ENVSH (relight) + ENVEXP (auto-exposure) from the float data
+      const tw=Math.min(im.w,2048),th=tw>>1, ldr=hdrToLDR(im.data,im.w,im.h,ENVEXP*HDREXPO,tw,th);  // downsample (backdrop) + bake ACES/exposure -> RGBA8
+      uploadTex(()=>gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,tw,th,0,gl.RGBA,gl.UNSIGNED_BYTE,ldr));
+      console.log('HDR loaded',file,im.w+'x'+im.h);}).catch(e=>console.warn('HDR load failed:',file,e));
+  }else{const im=new Image();im.crossOrigin='anonymous';
+    im.onload=()=>{uploadTex(()=>gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB,gl.RGB,gl.UNSIGNED_BYTE,im));ENVTINT=[1,1,1];};
+    im.onerror=()=>console.warn('HDRi load failed:',file);im.src=HDRBASE+file;}}
+fetch(HDRBASE+'list.json').then(r=>r.json()).then(list=>{          // populate the picker, load the first
+  HDRLIST=list; const sel=document.getElementById('hdrSel');
+  const pick=(HDRSEL&&list.some(h=>h.file===HDRSEL))?HDRSEL:((list[0]&&list[0].file)||'neurathen_rock_castle.jpg');
+  if(sel&&list.length){sel.innerHTML=list.map(h=>`<option value="${h.file}"${h.file===pick?' selected':''}>${h.label||h.file}</option>`).join('');
+    sel.onchange=()=>{loadHdri(sel.value);sel.blur();};}
+  loadHdri(pick);
+}).catch(()=>loadHdri('neurathen_rock_castle.jpg'));
+function setHdrBtn(){const b=document.getElementById('hdrBtn');if(b)b.textContent='🌄 HDRi: '+(HDRON?'on':'off');}
+gl.useProgram(prog);  // restore splat program as the active one
+
+// camera (orbit, y-up in decoded z180 space; model center ~(0,0.92,-0.06))
+let az=parseFloat(_qs.get('az')??Math.PI),el=parseFloat(_qs.get('el')??(OPSI?0:0.1)),dist=parseFloat(_qs.get('dist')??(OPSI?3.0:3.2)),tgt=OPSI?[0,1,0.1]:[0,0.95,0];  // OPSI = the reference's settings.json camera; az/el/dist overridable via ?az=&el=&dist=
+const ELMIN=()=>Math.max(-1.4,Math.asin(Math.max(-1,Math.min(1,(GROUNDY+0.05-tgt[1])/dist))));  // keep eye above ground (no under-floor look-up)
+cv.onmousedown=e=>{const mv=ev=>{if(e.button===2){tgt[0]-=ev.movementX*0.002;tgt[1]+=ev.movementY*0.002;}
+  else{az+=ev.movementX*0.005;el=Math.max(ELMIN(),Math.min(1.4,el+ev.movementY*0.005));}};
+  const up=()=>{removeEventListener('mousemove',mv);removeEventListener('mouseup',up);};
+  addEventListener('mousemove',mv);addEventListener('mouseup',up);};
+cv.oncontextmenu=e=>e.preventDefault();
+addEventListener('wheel',e=>{dist*=Math.exp(e.deltaY*0.001);el=Math.max(ELMIN(),el);});
+
+// preallocated render scratch (grows with n) — no per-frame allocation => no GC hitching during playback
+let SC={n:0};
+function scratch(n){if(SC.n>=n)return SC;
+  SC={n,keys:new Float32Array(n),bi:new Uint16Array(n),idx:new Uint32Array(n),
+      col:new Float32Array(n*3),pos:new Float32Array(n*3),scl:new Float32Array(n*3),
+      rot:new Float32Array(n*4),opa:new Float32Array(n),pcol:new Float32Array(n*3)};
+  return SC;}
+const NBITS=parseInt(new URLSearchParams(location.search).get('nb')||'16');const NBUCK=1<<NBITS;  // depth-sort resolution (was 4096=12bit; finer = better blend of dense overlapping surfels)
+const CNTS=new Uint32Array(NBUCK+1);
+function setFrame(f){cur=f;seek.value=f;frEl.textContent=`f${f+1}/${G.NF}`;
+  const fc=document.getElementById('fc');fc.style.display='block';fc.textContent=f+1;}
+function togglePlay(){playing=!playing;playBtn.textContent=playing?'⏸':'▶';
+  if(playing){playT0=performance.now()-cur/RATE; if(snd.src){snd.currentTime=cur/PLAYFPS; snd.play().catch(()=>{});}}
+  else if(snd.src) snd.pause();}
+playBtn.onclick=()=>{togglePlay();playBtn.blur();};
+{const mb=document.getElementById('mute'); if(mb) mb.onclick=function(){snd.muted=!snd.muted;this.textContent=snd.muted?'🔇':'🔊';this.blur();};}
+seek.oninput=()=>{playing=false;playBtn.textContent='▶';setFrame(+seek.value); if(snd.src){snd.pause();snd.currentTime=(+seek.value)/PLAYFPS;}};
+
+const C0=0.28209479,SHC=[0.48860251,1.09254843,0.31539157,0.54627421,0.59004359,2.89061144,0.45704579,0.37317633,1.44530572];
+const NOSH=new URLSearchParams(location.search).get('nosh')==='1';   // debug: skip SH -> DC-only color
+function shade(d,cx,cy,cz,out){ // CPU SH eval -> col buffer (out = preallocated scratch)
+  const n=d.n,nSh=d.nShaded??n,r=NOSH?null:d.rest;
+  if(!out||out.length<n*3)out=new Float32Array(n*3);
+  const cl=v=>v<0?0:v>1?1:v;
+  // env IBL relight (Gracia-style): per-splat diffuse irradiance from the HDRi SH at the splat's normal.
+  const rlOn=(HDRON&&hdrTex&&RELIGHT>0&&ENVHASSH), sc=d.scl, ro=d.rot;
+  const Eavg=Math.max(1e-3,0.282095*(0.2126*ENVSH[0]+0.7152*ENVSH[1]+0.0722*ENVSH[2]));
+  for(let i=0;i<n;i++){
+    const b0=0.5+C0*d.col[i*3],b1=0.5+C0*d.col[i*3+1],b2=0.5+C0*d.col[i*3+2];
+    let v0,v1,v2;
+    if(i>=nSh||!r){v0=b0;v1=b1;v2=b2;}
+    else{
+      let dx=d.pos[i*3]-cx,dy=d.pos[i*3+1]-cy,dz=d.pos[i*3+2]-cz;
+      const L=Math.hypot(dx,dy,dz)||1;dx/=L;dy/=L;dz/=L;
+      const xx=dx*dx,yy=dy*dy,zz=dz*dz,xy=dx*dy,yz=dy*dz,xz=dx*dz;
+      const B=[-SHC[0]*dy,SHC[0]*dz,-SHC[0]*dx,
+        SHC[1]*xy,-SHC[1]*yz,SHC[2]*(2*zz-xx-yy),-SHC[1]*xz,SHC[3]*(xx-yy),
+        -0.59004359*dy*(3*xx-yy),2.89061144*xy*dz*0.5,-0.45704579*dy*(4*zz-xx-yy),
+        0.37317633*dz*(2*zz-3*xx-3*yy),-0.45704579*dx*(4*zz-xx-yy),1.44530572*dz*(xx-yy)*0.5,-0.59004359*dx*(xx-3*yy)];
+      v0=b0;v1=b1;v2=b2;
+      for(let c=0;c<15;c++){const bc=B[c];v0+=bc*r[i*45+c*3];v1+=bc*r[i*45+c*3+1];v2+=bc*r[i*45+c*3+2];}
+    }
+    if(rlOn){                                          // modulate by irradiance at the splat normal (thin axis rotated by quat)
+      const s0=sc[i*3],s1=sc[i*3+1],s2=sc[i*3+2],w=ro[i*4],x=ro[i*4+1],y=ro[i*4+2],z=ro[i*4+3];
+      let nx,ny,nz;
+      if(s0<=s1&&s0<=s2){nx=1-2*(y*y+z*z);ny=2*(x*y+w*z);nz=2*(x*z-w*y);}
+      else if(s1<=s2){nx=2*(x*y-w*z);ny=1-2*(x*x+z*z);nz=2*(y*z+w*x);}
+      else{nx=2*(x*z+w*y);ny=2*(y*z-w*x);nz=1-2*(x*x+y*y);}
+      const Y0=0.282095,Y1=-0.488603*ny,Y2=0.488603*nz,Y3=-0.488603*nx,
+        Y4=1.092548*nx*ny,Y5=-1.092548*ny*nz,Y6=0.315392*(3*nz*nz-1),Y7=-1.092548*nx*nz,Y8=0.546274*(nx*nx-ny*ny);
+      const er=ENVSH[0]*Y0+ENVSH[3]*Y1+ENVSH[6]*Y2+ENVSH[9]*Y3+ENVSH[12]*Y4+ENVSH[15]*Y5+ENVSH[18]*Y6+ENVSH[21]*Y7+ENVSH[24]*Y8;
+      const eg=ENVSH[1]*Y0+ENVSH[4]*Y1+ENVSH[7]*Y2+ENVSH[10]*Y3+ENVSH[13]*Y4+ENVSH[16]*Y5+ENVSH[19]*Y6+ENVSH[22]*Y7+ENVSH[25]*Y8;
+      const eb=ENVSH[2]*Y0+ENVSH[5]*Y1+ENVSH[8]*Y2+ENVSH[11]*Y3+ENVSH[14]*Y4+ENVSH[17]*Y5+ENVSH[20]*Y6+ENVSH[23]*Y7+ENVSH[26]*Y8;
+      const cf=v=>v<0.35?0.35:v>2.5?2.5:v;
+      v0*=1+RELIGHT*(cf(er/Eavg)-1);v1*=1+RELIGHT*(cf(eg/Eavg)-1);v2*=1+RELIGHT*(cf(eb/Eavg)-1);
+    }
+    out[i*3]=cl(v0);out[i*3+1]=cl(v1);out[i*3+2]=cl(v2);}
+  return out;
+}
+
+let playT0=0,fpsT=0,fpsN=0,fpsShown=0;
+function loop(t){
+  requestAnimationFrame(loop);
+  if(!G)return;
+  if(playing&&G.NF>1){const nf=Math.floor((t-playT0)*RATE)%G.NF;if(nf!==cur){if(nf<cur&&snd.src){snd.currentTime=0;snd.play().catch(()=>{});}setFrame(nf);}}
+  const d=G.is4dsl?decode4dsl(cur):decode(cur);
+  // fps meter (rendered fps; updates twice/sec)
+  fpsN++;if(t-fpsT>500){fpsShown=Math.round(fpsN*1000/(t-fpsT));fpsN=0;fpsT=t;
+    hud.textContent=`📄 ${__file} · ${(G.nG||G.N).toLocaleString()} splats · ${fpsShown} fps`;}
+  cv.width=Math.round(innerWidth*SS);cv.height=Math.round(innerHeight*SS);gl.viewport(0,0,cv.width,cv.height);
+  const ce=Math.cos(el),se=Math.sin(el);
+  const eye=[tgt[0]+dist*ce*Math.sin(az),tgt[1]+dist*se,tgt[2]+dist*ce*Math.cos(az)];
+  const fwd=[(tgt[0]-eye[0])/dist,(tgt[1]-eye[1])/dist,(tgt[2]-eye[2])/dist];
+  let rx=[fwd[2],0,-fwd[0]];const rl=Math.hypot(...rx)||1;rx=rx.map(v=>v/rl);
+  const up=[rx[1]*fwd[2]-rx[2]*fwd[1],rx[2]*fwd[0]-rx[0]*fwd[2],rx[0]*fwd[1]-rx[1]*fwd[0]];
+  const view=new Float32Array([rx[0],up[0],fwd[0],0, rx[1],up[1],fwd[1],0, rx[2],up[2],fwd[2],0,
+    -(rx[0]*eye[0]+rx[1]*eye[1]+rx[2]*eye[2]),-(up[0]*eye[0]+up[1]*eye[1]+up[2]*eye[2]),-(fwd[0]*eye[0]+fwd[1]*eye[1]+fwd[2]*eye[2]),1]);
+  // depth sort (back to front) — preallocated scratch, counting sort
+  const n=d.n,S=scratch(n),sortKeys=S.keys,bi=S.bi,idx=S.idx,cnts=CNTS;
+  for(let i=0;i<n;i++)sortKeys[i]=view[2]*d.pos[i*3]+view[6]*d.pos[i*3+1]+view[10]*d.pos[i*3+2];
+  let mn=Infinity,mx=-Infinity;
+  for(let i=0;i<n;i++){const v=sortKeys[i];if(v<mn)mn=v;if(v>mx)mx=v;}
+  const NB=NBUCK,sc=(NB-1)/Math.max(1e-9,mx-mn);cnts.fill(0);
+  for(let i=0;i<n;i++){const bI=NB-1-(((sortKeys[i]-mn)*sc)|0);bi[i]=bI;cnts[bI+1]++;}
+  for(let b=0;b<NB;b++)cnts[b+1]+=cnts[b];
+  for(let i=0;i<n;i++)idx[cnts[bi[i]]++]=i;
+  const col=shade(d,eye[0],eye[1],eye[2],S.col);
+  const put=(name,src,nc,dst)=>{
+    for(let j=0;j<n;j++){const i=idx[j];for(let k=0;k<nc;k++)dst[j*nc+k]=src[i*nc+k];}
+    gl.bindBuffer(gl.ARRAY_BUFFER,bufs[name]);gl.bufferData(gl.ARRAY_BUFFER,dst.subarray(0,n*nc),gl.DYNAMIC_DRAW);};
+  put('pos',d.pos,3,S.pos);put('scl',d.scl,3,S.scl);put('rot',d.rot,4,S.rot);put('opa',d.opa,1,S.opa);put('col',col,3,S.pcol);
+  const fov=FOVDEG*Math.PI/180,fy=cv.height/(2*Math.tan(fov/2));
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog,'view'),false,view);
+  gl.uniform2f(gl.getUniformLocation(prog,'focal'),fy,fy);
+  gl.uniform2f(gl.getUniformLocation(prog,'vp'),cv.width,cv.height);
+  gl.uniform1f(gl.getUniformLocation(prog,'dil'),DIL);
+  gl.uniform1f(gl.getUniformLocation(prog,'falk'),FALK);
+  gl.uniform1f(gl.getUniformLocation(prog,'gExp'),GRADE.exp); gl.uniform1f(gl.getUniformLocation(prog,'gTemp'),GRADE.temp);
+  gl.uniform1f(gl.getUniformLocation(prog,'gTint'),GRADE.tint); gl.uniform1f(gl.getUniformLocation(prog,'gCon'),GRADE.con);
+  gl.uniform1f(gl.getUniformLocation(prog,'gSat'),GRADE.sat);
+  gl.uniform1f(gl.getUniformLocation(prog,'gR'),GRADE.r); gl.uniform1f(gl.getUniformLocation(prog,'gG'),GRADE.g); gl.uniform1f(gl.getUniformLocation(prog,'gB'),GRADE.b);
+  gl.uniform1f(gl.getUniformLocation(prog,'gBlk'),GRADE.blk); gl.uniform1f(gl.getUniformLocation(prog,'gWht'),GRADE.wht);
+  gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
+  if(HDRON&&hdrTex){                                  // equirect HDRi backdrop behind the splats
+    gl.useProgram(bgProg);
+    gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,hdrTex);gl.uniform1i(uBg.hdr,0);
+    gl.uniformMatrix3fv(uBg.invR,false,new Float32Array([rx[0],rx[1],rx[2],up[0],up[1],up[2],fwd[0],fwd[1],fwd[2]]));
+    gl.uniform3f(uBg.camPos,eye[0],eye[1],eye[2]);
+    gl.uniform1f(uBg.aspect,cv.width/cv.height);gl.uniform1f(uBg.thf,Math.tan(fov/2));gl.uniform1f(uBg.expo,HDREXPO*ENVEXP);gl.uniform1f(uBg.yaw,HDRYAW);
+    gl.uniform1f(uBg.radius,HDRRAD);gl.uniform1f(uBg.capH,HDRCAPH);gl.uniform1f(uBg.dbg,ENVDBG);
+    gl.uniform3f(uBg.envC,0,GROUNDY,0);            // HDRi world anchored at the performer (origin xz, ground y) => locked to him
+    // shape-aware shadow: footprint centered on the actor's XZ centroid, rebuilt + uploaded this frame
+    let sx=0,sz=0,cc=0;for(let i=0;i<n;i+=2){if(d.opa[i]<0.25)continue;sx+=d.pos[i*3];sz+=d.pos[i*3+2];cc++;}
+    const cxz=[cc?sx/cc:0,cc?sz/cc:0]; buildShadow(d,n,cxz);
+    gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,shadTex);gl.activeTexture(gl.TEXTURE0);gl.uniform1i(uBg.shadowTex,1);
+    gl.uniform3f(uBg.shadowC,cxz[0],GROUNDY,cxz[1]);gl.uniform1f(uBg.shadowK,HDRSHADOW);gl.uniform1f(uBg.shadowFR,SHADHAS?SHADFR:0.0);
+    gl.disable(gl.BLEND);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);gl.enable(gl.BLEND);
+    gl.useProgram(prog);
+  }
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,n);
+  pump(t);   // pre-decode upcoming frames so the next ticks are cache hits
+}
+requestAnimationFrame(loop);
+
+const DIL=parseFloat(new URLSearchParams(location.search).get('dilate')??'0.3');
+const FALK=parseFloat(_qs.get('falk')??(OPSI?'4':'1.0'));  // falloff sharpness (1=soft, 4=the reference-sharp)
+const GRADE={exp:0,temp:0,tint:0,con:1,sat:1,r:1,g:1,b:1,blk:0,wht:1};  // COLOR GRADE state (identity); grade panel updates live, pack_ewa.py bakes
+addEventListener('keydown',e=>{if(e.code==='Space'&&!e.repeat){e.preventDefault();e.stopPropagation();togglePlay();}},true);
+let __file=_qs.get('file')||'—';
+function setFile(n){__file=n;}   // filename now shown in the HUD (top-left)
+setFile(__file);
+const qf=_qs.get('file');
+if(qf){hud.textContent='fetching '+qf;setFile(qf.split('/').pop());
+  fetch('/'+qf).then(r=>r.arrayBuffer()).then(load).catch(err=>{hud.textContent='ERROR: '+err;});}
+// "Load Current": fetch the latest gsav the agent produced (a pointer file the agent keeps updated)
+async function loadCurrent(){
+  hud.textContent='loading current…';
+  try{
+    // manifest lists {file,label}; try both servers (repo tree on :8123, site/ on :8124)
+    let m=null; for(const u of ['/repro/_current.json','/_current.json']){try{const r=await fetch(u+'?'+Date.now());if(r.ok){m=await r.json();break;}}catch(e){}}
+    if(!m)throw 'no _current.json found (agent has not set a current file)';
+    const path=m.file; const cands=['/'+path.replace(/^\/+/,''),'/repro/'+path.replace(/^(repro\/)?/,''),'/site/'+path.split('/').pop()];
+    let buf=null,got='';for(const u of cands){try{const r=await fetch(u+'?'+Date.now());if(r.ok){buf=await r.arrayBuffer();got=u;break;}}catch(e){}}
+    if(!buf)throw 'current file not reachable: '+path;
+    setFile((m.label?m.label+' · ':'')+path.split('/').pop());
+    await load(buf);
+  }catch(err){hud.textContent='Load Current ERROR: '+err;console.error(err);}
+}
+document.getElementById('loadcur').onclick=()=>{loadCurrent();document.getElementById('loadcur').blur();};
+document.getElementById('hdrBtn').onclick=()=>{HDRON=!HDRON;setHdrBtn();document.getElementById('hdrBtn').blur();};
+setHdrBtn();
+addEventListener('dragover',e=>e.preventDefault());
+addEventListener('drop',async e=>{e.preventDefault();
+  const f=e.dataTransfer.files[0];if(!f)return;setFile(f.name);
+  hud.textContent='loading '+f.name;
+  try{await load(await f.arrayBuffer());}catch(err){hud.textContent='ERROR: '+err;console.error(err);}});
+
+// ===== render-state exposure for _renderdump.js (cross-viewer comparison) =====
+window.__mint={
+  file:()=>__file, frame:()=>cur, nG:()=>(G&&(G.nG||G.N))||0,
+  config:()=>({fovDeg:FOVDEG, falk:FALK, dilation:DIL, supersample:SS, sortBuckets:NBUCK, minorEigClamp:0.1, falloff:'exp(-A) (true gaussian); A=mahalanobis^2/2'}),
+  camera:()=>{const ce=Math.cos(el),se=Math.sin(el);
+    const eye=[tgt[0]+dist*ce*Math.sin(az),tgt[1]+dist*se,tgt[2]+dist*ce*Math.cos(az)];
+    const fwd=[(tgt[0]-eye[0])/dist,(tgt[1]-eye[1])/dist,(tgt[2]-eye[2])/dist];
+    let rx=[fwd[2],0,-fwd[0]];const rl=Math.hypot(...rx)||1;rx=rx.map(v=>v/rl);
+    const up=[rx[1]*fwd[2]-rx[2]*fwd[1],rx[2]*fwd[0]-rx[0]*fwd[2],rx[0]*fwd[1]-rx[1]*fwd[0]];
+    const view=[rx[0],up[0],fwd[0],0, rx[1],up[1],fwd[1],0, rx[2],up[2],fwd[2],0,
+      -(rx[0]*eye[0]+rx[1]*eye[1]+rx[2]*eye[2]),-(up[0]*eye[0]+up[1]*eye[1]+up[2]*eye[2]),-(fwd[0]*eye[0]+fwd[1]*eye[1]+fwd[2]*eye[2]),1];
+    const fov=FOVDEG*Math.PI/180, focalPx=cv.height/(2*Math.tan(fov/2));
+    return {eye,target:[...tgt],az,el,dist,fovDeg:FOVDEG,focalPx,viewport:[cv.width,cv.height],dpr:SS,view};},
+  // current-frame decoded splats {pos,scl(world),rot(wxyz),opa,col,n}
+  decode:()=>G&&(G.is4dsl?decode4dsl(cur):decode(cur)),
+  // EXACT shader projection in JS -> on-screen footprint (major/minor radius px) for splat i
+  project:(d,i,view,focalPx)=>{const P=d.pos,Rt=d.rot,Sc=d.scl;
+    const px=P[i*3],py=P[i*3+1],pz=P[i*3+2];
+    const tz=view[2]*px+view[6]*py+view[10]*pz+view[14];
+    const tx=view[0]*px+view[4]*py+view[8]*pz+view[12], ty=view[1]*px+view[5]*py+view[9]*pz+view[13];
+    if(tz<0.2)return null;
+    const w=Rt[i*4],x=Rt[i*4+1],y=Rt[i*4+2],z=Rt[i*4+3],s2=[Sc[i*3]**2,Sc[i*3+1]**2,Sc[i*3+2]**2];
+    const R=[[1-2*(y*y+z*z),2*(x*y-w*z),2*(x*z+w*y)],[2*(x*y+w*z),1-2*(x*x+z*z),2*(y*z-w*x)],[2*(x*z-w*y),2*(y*z+w*x),1-2*(x*x+y*y)]];
+    const cw=(a,b)=>{let v=0;for(let k=0;k<3;k++)v+=R[a][k]*s2[k]*R[b][k];return v;};
+    const V3=[[view[0],view[4],view[8]],[view[1],view[5],view[9]],[view[2],view[6],view[10]]];
+    const cvv=(a,b)=>{let v=0;for(let m=0;m<3;m++)for(let n=0;n<3;n++)v+=V3[a][m]*cw(m,n)*V3[b][n];return v;};
+    const J=[[focalPx/tz,0,-focalPx*tx/(tz*tz)],[0,focalPx/tz,-focalPx*ty/(tz*tz)]];
+    const c2=(a,b)=>{let v=0;for(let m=0;m<3;m++)for(let n=0;n<3;n++)v+=J[a][m]*cvv(m,n)*J[b][n];return v;};
+    const a=c2(0,0)+DIL,b2=c2(0,1),c=c2(1,1)+DIL;
+    const mid=0.5*(a+c),rr=Math.sqrt(Math.max(0,mid*mid-(a*c-b2*b2)));
+    return {tz,projPx:[tx*focalPx/tz,ty*focalPx/tz],majorPx:Math.sqrt(2*(mid+rr)),minorPx:Math.sqrt(2*Math.max(mid-rr,0.1)),cov2d:[a,b2,c],opacity:d.opa[i]};}
+};
+console.log('[mint] __mint render-state exposed. Load _renderdump.js then run mem.dump()');
+// ===== color grade panel: live per-splat preview (shader) -> bake into EWA (pack_ewa.py GRADE=...) =====
+(function(){
+  const ids=['exp','temp','tint','con','sat','blk','wht','r','g','b'], def={exp:0,temp:0,tint:0,con:1,sat:1,blk:0,wht:1,r:1,g:1,b:1};
+  const panel=document.getElementById('grade');
+  document.getElementById('gradeBtn').onclick=()=>{ panel.style.display=panel.style.display==='none'?'block':'none'; };
+  const set=(k,v)=>{ GRADE[k]=v; document.getElementById('gv_'+k).textContent=v.toFixed(2); };
+  ids.forEach(k=>{ const s=document.getElementById('gs_'+k); s.oninput=()=>set(k,parseFloat(s.value)); });
+  document.getElementById('g_reset').onclick=()=>ids.forEach(k=>{ const s=document.getElementById('gs_'+k); s.value=def[k]; set(k,def[k]); });
+  document.getElementById('g_copy').onclick=()=>{
+    const j=JSON.stringify(GRADE);
+    if(navigator.clipboard) navigator.clipboard.writeText(j);
+    console.log('GRADE='+j);
+    prompt('Grade copied. To bake it into the final EWA, give this JSON back to the agent (or run pack_ewa.py with env GRADE set to it):', j);
+  };
+})();
+// ===== auto-load TEST_1306 from R2 with a download-progress readout (210 MB) =====
+(async()=>{
+  const R2='https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/TEST_1306_graded.ewa';
+  const hud=document.getElementById('hud'), bar=document.getElementById('bar');
+  try{
+    if(hud) hud.textContent='downloading TEST_1306 (210 MB)…';
+    const res=await fetch(R2);
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const total=+(res.headers.get('Content-Length')||0);
+    const reader=res.body.getReader(); const parts=[]; let got=0;
+    for(;;){ const {done,value}=await reader.read(); if(done) break; parts.push(value); got+=value.length;
+      if(hud) hud.textContent='downloading TEST_1306… '+(total?Math.round(got/total*100)+'%':((got/1048576)|0)+' MB'); }
+    const buf=new Uint8Array(got); let off=0; for(const p of parts){ buf.set(p,off); off+=p.length; }
+    if(hud) hud.textContent='decoding…';
+    await load(buf.buffer);
+    if(hud) hud.textContent='';
+    if(bar) bar.style.display='flex';
+  }catch(e){ if(hud) hud.textContent='load failed: '+e.message; console.error('EWA load failed',e); }
+})();
+</script></body></html>
