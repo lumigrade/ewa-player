@@ -862,10 +862,12 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
 // Places the volumetric performer on a real floor (hit-test) and renders the same splats from the phone's
 // pose, with a soft contact shadow. iOS Safari has no WebXR -> the button stays hidden (3D fallback only).
 // NOTE: written against the WebXR Device API spec; could not be run on a headset/phone here -> test on-device.
-const AR_VERSION='v1.4';   // bump on every AR change so the user can tell a fresh build from a cached one
+const AR_VERSION='v2.0 (three.js)';   // bump on every AR change so the user can tell a fresh build from a cached one
 { const _vb=document.getElementById('verBadge'); if(_vb) _vb.textContent='EWA Player '+AR_VERSION; }
 (function(){
   const arBtn=document.getElementById('arBtn'), arHint=document.getElementById('arHint');
+  return;  // OLD hand-rolled WebXR AR DISABLED — superseded by the THREE.js AR (v2.0) appended at the end of this module.
+  // (everything below is dead/parsed-only; THREE.js renderer.xr now drives session/camera/projection/anchoring.)
   if(!('xr' in navigator)||!navigator.xr){ return; }
   navigator.xr.isSessionSupported('immersive-ar').then(ok=>{ if(ok&&arBtn) arBtn.style.display='block'; }).catch(()=>{});
 
@@ -1092,6 +1094,255 @@ const AR_VERSION='v1.4';   // bump on every AR change so the user can tell a fre
       audioStarted=true; hideSndHint(); if(snd.src){ syncAudio(); snd.play().catch(()=>{}); }
       session.requestAnimationFrame(onXRFrame);
     }catch(e){ inXR=false; session=null; console.error('AR session failed',e); if(arHint){arHint.style.display='block';arHint.textContent='AR failed: '+e.message; setTimeout(()=>arHint.style.display='none',4000);} }
+  }
+  if(arBtn) arBtn.onclick=()=>{ enterAR(); arBtn.blur(); };
+})();
+
+// ============================== WebXR AR v2.0 — rebuilt on THREE.js ==============================
+// THREE's renderer.xr manages the AR session, per-frame camera pose, projection and WORLD-ANCHORING — the
+// three things the hand-rolled WebXR got wrong (pans-with-camera, landscape upside-down, preview-page). The
+// EWA decode + splat data are reused verbatim (decodeAny/cur); the gaussian-splat covariance math is ported
+// VERBATIM from the proven 3D shader (VS2) into THREE's camera frame. The 3D (#cv) path is untouched.
+// THREE is dynamically imported on Enter-AR so a CDN failure can never break 3D. Android only (iOS has no WebXR).
+(function(){
+  const arBtn=document.getElementById('arBtn'), arHint=document.getElementById('arHint');
+  if(!('xr' in navigator)||!navigator.xr) return;
+  navigator.xr.isSessionSupported('immersive-ar').then(ok=>{ if(ok&&arBtn) arBtn.style.display='block'; }).catch(()=>{});
+
+  const TARGET_H=parseFloat(_qs.get('arh')??'1.7');                 // real actor height (m)
+  const ARYAW=parseFloat(_qs.get('aryaw')??'0');                    // facing offset; ?aryaw=3.14159 to flip front/back
+  let THREE=null, renderer=null, camera=null, scene=null, mat=null;
+  let splatMesh=null, anchorGroup=null, modelGroup=null, centerGroup=null, reticle=null, feetRing=null, shadow=null;
+  let session=null, hitSource=null, refSpace=null, lightProbe=null;
+  let box=null, baseScale=1, faceY=0, placed=false, lastTouchMs=0, _hint='', maxN=0;
+  let aCenter,aScale,aQuat,aOpa,aCol, keyArr,idxArr,cntArr; const NB=4096;
+  const _mv=()=>new THREE.Matrix4(), _v3=()=>new THREE.Vector3();
+  let mvM=null,tmpQ=null,tmpS=null;
+
+  function setHint(s){ if(arHint&&_hint!==s){_hint=s; arHint.textContent=s;} }
+  function feetOp(){ return Math.max(0,Math.min(1, 1-(performance.now()-lastTouchMs-3000)/700)); }
+
+  // ---- gaussian-splat material: VS2 covariance math ported into THREE's -z camera frame ----
+  const SPLAT_VS=`precision highp float; precision highp int;
+    in vec2 corner; in vec3 iCenter; in vec3 iScale; in vec4 iQuat; in float iOpacity; in vec3 iColor;
+    uniform mat4 modelViewMatrix, projectionMatrix; uniform vec2 viewport; uniform float dil;
+    out vec2 vPx; out float vOp; out vec3 vCol; out vec4 vConic;
+    void main(){
+      vec4 cam = modelViewMatrix * vec4(iCenter,1.0);
+      float tz = -cam.z;                                  // depth>0 in front (THREE looks down -z)
+      if(tz < 0.2){ gl_Position=vec4(0.,0.,2.,1.); return; }
+      vec3 tc = vec3(cam.x, cam.y, tz);                   // +z-forward position (matches VS2's 'tc')
+      mat3 W = mat3(modelViewMatrix);
+      mat3 V3 = W; V3[0][2]=-V3[0][2]; V3[1][2]=-V3[1][2]; V3[2][2]=-V3[2][2];   // FlipZ*W = +z-forward basis (VS2's V3)
+      float fx = projectionMatrix[0][0]*viewport.x*0.5;
+      float fy = projectionMatrix[1][1]*viewport.y*0.5;
+      vec2 focal = vec2(fx,fy);
+      float w=iQuat.x,x=iQuat.y,y=iQuat.z,z=iQuat.w;       // stored (w,x,y,z) — same as VS2 (irot.x=w)
+      mat3 Rq=mat3(1.-2.*(y*y+z*z),2.*(x*y+w*z),2.*(x*z-w*y),
+                   2.*(x*y-w*z),1.-2.*(x*x+z*z),2.*(y*z+w*x),
+                   2.*(x*z+w*y),2.*(y*z-w*x),1.-2.*(x*x+y*y));
+      mat3 S=mat3(iScale.x,0.,0., 0.,iScale.y,0., 0.,0.,iScale.z);
+      mat3 M=Rq*S; mat3 cov3=V3*M*transpose(M)*transpose(V3);                    // ---- VS2 body verbatim ----
+      mat3 J=mat3(focal.x/tz,0.,0., 0.,focal.y/tz,0., -focal.x*tc.x/(tz*tz),-focal.y*tc.y/(tz*tz),0.);
+      mat3 c2m=transpose(J)*cov3*J;
+      float a0=c2m[0][0],b2=c2m[0][1],c0=c2m[1][1];
+      float a=a0+dil,c=c0+dil; float det0=a0*c0-b2*b2;
+      float mid=0.5*(a+c),r=sqrt(max(1e-6,mid*mid-(a*c-b2*b2)));
+      float lam1=mid+r, lam2=max(mid-r,0.1);
+      vec2 dir=(abs(b2)<1e-7&&a>=c)?vec2(1.,0.):normalize(vec2(b2,lam1-a));
+      lam1=min(lam1,lam2*100.);                            // anti-spike major-axis clamp (aniso<=10)
+      float dx=dir.x,dy=dir.y;
+      float A2=lam1*dx*dx+lam2*dy*dy, B2=(lam1-lam2)*dx*dy, C2=lam1*dy*dy+lam2*dx*dx;
+      float det=A2*C2-B2*B2;
+      if(det<=0.){ gl_Position=vec4(0.,0.,2.,1.); return; }
+      float comp=sqrt(max(0.,det0/det));
+      float rad=ceil(3.*sqrt(lam1));
+      vPx=corner*rad; vOp=iOpacity*comp; vCol=iColor; vConic=vec4(C2/det,-B2/det,A2/det,0.);
+      vec4 clip=projectionMatrix*cam;                      // ---- positioning: THREE projection (correct off-center XR frustum) ----
+      gl_Position=clip;
+      gl_Position.xy += (vPx/(viewport*0.5))*clip.w;       // gaussian extent offset (NDC*w; +y up, no flip needed)
+    }`;
+  const SPLAT_FS=`precision highp float;
+    in vec2 vPx; in float vOp; in vec3 vCol; in vec4 vConic;
+    uniform float falk; uniform vec3 arAmb;
+    uniform float gExp,gTemp,gTint,gCon,gSat,gR,gG,gB,gBlk,gWht;
+    out vec4 outColor;
+    vec3 grade(vec3 c){ c*=exp2(gExp); c*=vec3(1.+gTemp,1.,1.-gTemp); c*=vec3(1.-gTint,1.+gTint,1.-gTint);
+      c*=vec3(gR,gG,gB); c=(c-gBlk)/max(gWht-gBlk,0.01); c=(c-0.5)*gCon+0.5;
+      float l=dot(c,vec3(0.2126,0.7152,0.0722)); return mix(vec3(l),c,gSat); }
+    void main(){
+      float A=0.5*(vConic.x*vPx.x*vPx.x+vConic.z*vPx.y*vPx.y)+vConic.y*vPx.x*vPx.y;
+      float al=vOp*exp(-falk*A); if(al<0.0039)discard;
+      outColor=vec4(grade(vCol)*arAmb*al, al);
+    }`;
+
+  function makeShadowTex(){
+    const s=128, cv=document.createElement('canvas'); cv.width=cv.height=s; const x=cv.getContext('2d');
+    const g=x.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);
+    g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(0.55,'rgba(120,120,120,1)'); g.addColorStop(1,'rgba(0,0,0,1)');
+    x.fillStyle=g; x.fillRect(0,0,s,s); const t=new THREE.CanvasTexture(cv); t.colorSpace=THREE.NoColorSpace; return t;
+  }
+  function initThree(){
+    renderer=new THREE.WebGLRenderer({alpha:true,antialias:true});
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.5));
+    renderer.setSize(window.innerWidth,window.innerHeight);
+    renderer.xr.enabled=true;
+    renderer.domElement.id='arcv';
+    renderer.domElement.style.cssText='position:fixed;inset:0;width:100vw;height:100vh;z-index:1;display:none';
+    document.body.appendChild(renderer.domElement);
+    camera=new THREE.PerspectiveCamera(60,window.innerWidth/window.innerHeight,0.05,100);   // placeholder; XR overrides per frame
+    scene=new THREE.Scene();
+    anchorGroup=new THREE.Group(); scene.add(anchorGroup);
+    modelGroup=new THREE.Group(); anchorGroup.add(modelGroup);
+    centerGroup=new THREE.Group(); modelGroup.add(centerGroup);
+    reticle=new THREE.Mesh(new THREE.RingGeometry(0.10,0.14,48).rotateX(-Math.PI/2),
+      new THREE.MeshBasicMaterial({color:0x33d6ff,transparent:true,opacity:0.9,depthTest:false,depthWrite:false}));
+    reticle.matrixAutoUpdate=false; reticle.visible=false; reticle.renderOrder=2; scene.add(reticle);
+    feetRing=new THREE.Mesh(new THREE.RingGeometry(0.14,0.185,48).rotateX(-Math.PI/2),
+      new THREE.MeshBasicMaterial({color:0xb3f2ff,transparent:true,opacity:0,depthTest:false,depthWrite:false}));
+    feetRing.position.y=0.004; feetRing.visible=false; feetRing.renderOrder=2; anchorGroup.add(feetRing);
+    shadow=new THREE.Mesh(new THREE.CircleGeometry(0.5,48).rotateX(-Math.PI/2),
+      new THREE.MeshBasicMaterial({color:0x000000,transparent:true,opacity:0.5,alphaMap:makeShadowTex(),depthWrite:false,depthTest:false}));
+    shadow.position.y=0.002; shadow.visible=false; shadow.renderOrder=0; anchorGroup.add(shadow);
+    mat=new THREE.RawShaderMaterial({ glslVersion:THREE.GLSL3, vertexShader:SPLAT_VS, fragmentShader:SPLAT_FS,
+      transparent:true, depthTest:false, depthWrite:false,
+      blending:THREE.CustomBlending, blendSrc:THREE.OneFactor, blendDst:THREE.OneMinusSrcAlphaFactor,
+      uniforms:{ viewport:{value:new THREE.Vector2(1,1)}, dil:{value:(typeof DIL!=='undefined'?DIL:0.3)}, falk:{value:(typeof FALK!=='undefined'?FALK:4.0)},
+        arAmb:{value:new THREE.Vector3(1,1,1)},
+        gExp:{value:0},gTemp:{value:0},gTint:{value:0},gCon:{value:1},gSat:{value:1},gR:{value:1},gG:{value:1},gB:{value:1},gBlk:{value:0},gWht:{value:1} } });
+    mvM=new THREE.Matrix4(); tmpQ=new THREE.Quaternion(); tmpS=new THREE.Vector3();
+  }
+  function buildSplat(n){
+    maxN=n;
+    aCenter=new Float32Array(n*3); aScale=new Float32Array(n*3); aQuat=new Float32Array(n*4);
+    aOpa=new Float32Array(n); aCol=new Float32Array(n*3);
+    keyArr=new Float32Array(n); idxArr=new Uint32Array(n); cntArr=new Uint32Array(NB+1);
+    const geo=new THREE.InstancedBufferGeometry();
+    geo.setAttribute('corner',new THREE.Float32BufferAttribute([-1,-1, 1,-1, -1,1, 1,1],2));
+    geo.setIndex([0,1,2, 2,1,3]);
+    const ia=(arr,sz)=>{const a=new THREE.InstancedBufferAttribute(arr,sz); a.setUsage(THREE.DynamicDrawUsage); return a;};
+    geo.setAttribute('iCenter',ia(aCenter,3)); geo.setAttribute('iScale',ia(aScale,3));
+    geo.setAttribute('iQuat',ia(aQuat,4)); geo.setAttribute('iOpacity',ia(aOpa,1)); geo.setAttribute('iColor',ia(aCol,3));
+    geo.instanceCount=0;
+    splatMesh=new THREE.Mesh(geo,mat); splatMesh.frustumCulled=false; splatMesh.renderOrder=1;
+    splatMesh.onBeforeRender=sortUpload; centerGroup.add(splatMesh);
+  }
+  function computeBox(){
+    const d=decodeAny(cur); if(!d)return null;
+    let mnx=Infinity,mny=Infinity,mnz=Infinity,mxx=-Infinity,mxy=-Infinity,mxz=-Infinity;
+    for(let i=0;i<d.n;i++){ if(d.opa[i]<0.2)continue; const x=d.pos[i*3],y=d.pos[i*3+1],z=d.pos[i*3+2];
+      if(x<mnx)mnx=x;if(x>mxx)mxx=x;if(y<mny)mny=y;if(y>mxy)mxy=y;if(z<mnz)mnz=z;if(z>mxz)mxz=z; }
+    if(!isFinite(mnx))return null;
+    return {feetY:mny,cx:(mnx+mxx)/2,cz:(mnz+mxz)/2,h:Math.max(0.1,mxy-mny),fr:0.5*Math.max(mxx-mnx,mxz-mnz)};
+  }
+  function applyBox(){
+    centerGroup.position.set(-box.cx,-box.feetY,-box.cz);   // feet+XZ-center -> model origin (feet at y=0)
+    baseScale=TARGET_H/box.h; modelGroup.scale.setScalar(baseScale);
+    const r=Math.max(0.08,box.fr*baseScale);
+    shadow.scale.set(r/0.5*1.2,1,r/0.5*1.2); feetRing.scale.setScalar(Math.max(0.6,r/0.18));
+  }
+  // back-to-front counting sort + upload the current decoded frame's instances
+  function sortUpload(rndr,scn,cam){
+    if(!box||!G) return;
+    const d=decodeAny(cur); if(!d) return; let n=d.n;
+    if(n>maxN){ n=maxN; }   // safety clamp (fixed-identity EWA keeps n constant; block frames rare)
+    const sz=rndr.getDrawingBufferSize(new THREE.Vector2()); mat.uniforms.viewport.value.set(sz.x,sz.y);
+    const u=mat.uniforms; if(typeof GRADE!=='undefined'){u.gExp.value=GRADE.exp;u.gTemp.value=GRADE.temp;u.gTint.value=GRADE.tint;u.gCon.value=GRADE.con;u.gSat.value=GRADE.sat;u.gR.value=GRADE.r;u.gG.value=GRADE.g;u.gB.value=GRADE.b;u.gBlk.value=GRADE.blk;u.gWht.value=GRADE.wht;}
+    if(typeof FALK!=='undefined')u.falk.value=FALK; if(typeof DIL!=='undefined')u.dil.value=DIL;
+    mvM.multiplyMatrices(cam.matrixWorldInverse, splatMesh.matrixWorld); const e=mvM.elements;
+    const P=d.pos; let mn=Infinity,mx=-Infinity;
+    for(let i=0;i<n;i++){ const k=e[2]*P[i*3]+e[6]*P[i*3+1]+e[10]*P[i*3+2]+e[14]; keyArr[i]=k; if(k<mn)mn=k; if(k>mx)mx=k; }
+    const sc=(NB-1)/Math.max(1e-9,mx-mn); cntArr.fill(0);
+    for(let i=0;i<n;i++){ const b=((keyArr[i]-mn)*sc)|0; cntArr[b+1]++; }   // ascending cam.z = farthest(most -z) first = back-to-front
+    for(let b=0;b<NB;b++)cntArr[b+1]+=cntArr[b];
+    for(let i=0;i<n;i++){ const b=((keyArr[i]-mn)*sc)|0; idxArr[cntArr[b]++]=i; }
+    const C=aCenter,Sc=aScale,Q=aQuat,O=aOpa,Co=aCol, sp=d.pos,ss=d.scl,sr=d.rot,so=d.opa,scl=d.col;
+    for(let j=0;j<n;j++){ const i=idxArr[j];
+      C[j*3]=sp[i*3];C[j*3+1]=sp[i*3+1];C[j*3+2]=sp[i*3+2];
+      Sc[j*3]=ss[i*3];Sc[j*3+1]=ss[i*3+1];Sc[j*3+2]=ss[i*3+2];
+      Q[j*4]=sr[i*4];Q[j*4+1]=sr[i*4+1];Q[j*4+2]=sr[i*4+2];Q[j*4+3]=sr[i*4+3];
+      O[j]=so[i]; Co[j*3]=scl[i*3];Co[j*3+1]=scl[i*3+1];Co[j*3+2]=scl[i*3+2]; }
+    const g=splatMesh.geometry;
+    for(const nm of ['iCenter','iScale','iQuat','iOpacity','iColor']){ const at=g.getAttribute(nm); at.needsUpdate=true; }
+    g.instanceCount=n;
+  }
+  function readLight(frame){
+    let amb=[1,1,1];
+    if(lightProbe){ let est=null; try{est=frame.getLightEstimate(lightProbe);}catch(e){est=null;}
+      if(est){ const sh=est.sphericalHarmonicsCoefficients;
+        if(sh&&sh.length>=3){ const r=sh[0],g=sh[1],b=sh[2], lum=Math.max(1e-4,0.2126*r+0.7152*g+0.0722*b), k=0.5, cl=v=>Math.max(0.55,Math.min(1.5,v));
+          amb=[cl(1+(r/lum-1)*k),cl(1+(g/lum-1)*k),cl(1+(b/lum-1)*k)]; } } }
+    if(mat) mat.uniforms.arAmb.value.set(amb[0],amb[1],amb[2]);
+  }
+  function onFrame(time, xrFrame){
+    advanceFrame(time);                                  // playback clock + soundtrack sync (shared with 3D)
+    if(xrFrame && session && G){
+      refSpace=renderer.xr.getReferenceSpace();
+      if(!box){ box=computeBox(); if(box){ if(!splatMesh) buildSplat(decodeAny(cur).n); applyBox(); } }
+      readLight(xrFrame);
+      let hit=false;
+      if(hitSource && refSpace){ const hits=xrFrame.getHitTestResults(hitSource);
+        if(hits.length){ const p=hits[0].getPose(refSpace); if(p){ reticle.matrix.fromArray(p.transform.matrix); hit=true; } } }
+      if(!placed){ reticle.visible=hit; if(shadow)shadow.visible=false; if(feetRing)feetRing.visible=false;
+        setHint(hit?('Tap to place  ·  '+AR_VERSION):('Point your phone at the floor and move it slowly…  ·  '+AR_VERSION)); }
+      else { reticle.visible=false; if(shadow)shadow.visible=true;
+        const o=feetOp(); feetRing.visible=o>0.01; feetRing.material.opacity=o; }
+    }
+    renderer.render(scene,camera);
+  }
+  function onSelect(){ lastTouchMs=performance.now();
+    if(!placed && reticle.visible){
+      reticle.matrix.decompose(anchorGroup.position, tmpQ, tmpS);   // floor position
+      anchorGroup.quaternion.identity();                            // keep upright (use only the floor point, not its tilt)
+      const xc=renderer.xr.getCamera(); const cx=xc.position.x, cz=xc.position.z;
+      faceY=Math.atan2(cx-anchorGroup.position.x, cz-anchorGroup.position.z)+ARYAW;
+      modelGroup.rotation.y=faceY; placed=true;
+      setHint('Placed — pinch to resize · twist to turn · walk around  ·  '+AR_VERSION);
+    }
+  }
+  // pinch=scale, twist=yaw (dom-overlay touches)
+  let _t0=null;
+  const _ti=ts=>{const a=ts[0],b=ts[1]; return {d:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY), ang:Math.atan2(b.clientY-a.clientY,b.clientX-a.clientX)};};
+  function onTS(e){ lastTouchMs=performance.now(); if(e.touches.length===2){ _t0=_ti(e.touches); _t0.s=modelGroup.scale.x; _t0.y=faceY; e.preventDefault(); } }
+  function onTM(e){ lastTouchMs=performance.now();
+    if(_t0&&e.touches.length===2){ const c=_ti(e.touches);
+      modelGroup.scale.setScalar(Math.max(baseScale*0.2,Math.min(baseScale*5,_t0.s*(c.d/Math.max(1,_t0.d)))));
+      faceY=_t0.y+(c.ang-_t0.ang); modelGroup.rotation.y=faceY; e.preventDefault(); } }
+  function onTE(e){ if(e.touches.length<2)_t0=null; }
+  function onEnd(){
+    inXR=false; placed=false; box=null;
+    try{ renderer.setAnimationLoop(null); }catch(e){}
+    if(session){ try{session.removeEventListener('select',onSelect);}catch(e){} try{session.removeEventListener('end',onEnd);}catch(e){} }
+    session=null; hitSource=null; lightProbe=null;
+    window.removeEventListener('touchstart',onTS); window.removeEventListener('touchmove',onTM); window.removeEventListener('touchend',onTE);
+    if(renderer) renderer.domElement.style.display='none';
+    const cv=document.getElementById('cv'); if(cv)cv.style.display='';
+    if(arHint)arHint.style.display='none'; if(arBtn)arBtn.style.display='block';
+    requestAnimationFrame(loop);
+  }
+  async function enterAR(){
+    try{
+      if(arHint){arHint.style.display='block';} setHint('starting AR…  ·  '+AR_VERSION);
+      if(!THREE){ THREE=await import('https://unpkg.com/three@0.160.0/build/three.module.js'); initThree(); }
+      session=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['local-floor','dom-overlay','light-estimation'],domOverlay:{root:document.body}});
+      inXR=true; placed=false; box=null; faceY=0;
+      renderer.xr.setReferenceSpaceType('local-floor');
+      await renderer.xr.setSession(session);
+      const viewerSpace=await session.requestReferenceSpace('viewer');
+      try{ hitSource=await session.requestHitTestSource({space:viewerSpace}); }catch(e){ hitSource=null; }
+      try{ lightProbe=await session.requestLightProbe(); }catch(e){ lightProbe=null; }
+      session.addEventListener('select',onSelect);
+      session.addEventListener('end',onEnd);
+      const cv=document.getElementById('cv'); if(cv)cv.style.display='none';
+      renderer.domElement.style.display='block';
+      window.addEventListener('touchstart',onTS,{passive:false}); window.addEventListener('touchmove',onTM,{passive:false}); window.addEventListener('touchend',onTE);
+      if(arBtn)arBtn.style.display='none';
+      audioStarted=true; if(typeof hideSndHint==='function')hideSndHint(); if(snd&&snd.src){ if(typeof syncAudio==='function')syncAudio(); snd.play().catch(()=>{}); }
+      renderer.setAnimationLoop(onFrame);
+    }catch(e){ inXR=false; session=null; console.error('AR session failed',e);
+      const cv=document.getElementById('cv'); if(cv)cv.style.display='';
+      if(arHint){arHint.style.display='block'; arHint.textContent='AR failed: '+(e&&e.message||e); setTimeout(()=>{if(arHint)arHint.style.display='none';},5000);}
+      requestAnimationFrame(loop); }
   }
   if(arBtn) arBtn.onclick=()=>{ enterAR(); arBtn.blur(); };
 })();
