@@ -2,7 +2,7 @@
 <!-- Our own .gsav player. Decode: WebCodecs VP9 (bit-exact luma) + fzstd + exact site math.
      Render: WebGL2 instanced EWA splatting + full SH deg-3 (CPU-evaluated per view).
      Run: node serve.js  ->  http://localhost:8123/work/viewer.html  -> drop a .gsav -->
-<html><head><meta charset="utf-8"><title>4DSL Player</title><style>
+<html><head><meta charset="utf-8"><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0"><title>4DSL Player</title><style>
 html,body{margin:0;height:100%;background:#000;color:#ccc;font:13px monospace;overflow:hidden}
 #cv{width:100vw;height:100vh;display:block}
 #hud{position:fixed;left:10px;top:10px;background:#0008;padding:8px;border-radius:6px}
@@ -18,6 +18,7 @@ html,body{margin:0;height:100%;background:#000;color:#ccc;font:13px monospace;ov
 <div id="sndHint" style="position:fixed;left:50%;bottom:64px;transform:translateX(-50%);z-index:9;background:#000c;color:#fff;border:1px solid #888;border-radius:22px;font:bold 13px monospace;padding:9px 18px;cursor:pointer;display:none">👆 tap for sound 🔊</div>
 <button id="arBtn" style="position:fixed;left:50%;top:52px;transform:translateX(-50%);z-index:8;background:#0a7a4a;color:#fff;border:1px solid #1c9;border-radius:7px;font:bold 13px monospace;padding:10px 18px;cursor:pointer;display:none">📱 Enter AR</button>
 <div id="arHint" style="position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:10;background:#000c;color:#fff;border:1px solid #888;border-radius:8px;font:bold 13px monospace;padding:9px 16px;display:none">Move your phone to find the floor, then tap to place</div>
+<div id="verBadge" style="position:fixed;right:8px;bottom:8px;z-index:20;color:#9fb;opacity:0.55;font:bold 11px monospace;background:#0007;padding:3px 7px;border-radius:5px;pointer-events:none"></div>
 <select id="hdrSel" title="choose environment" style="position:fixed;top:10px;right:120px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 12px monospace;padding:8px 8px;cursor:pointer;max-width:200px"></select>
 <button id="hdrBtn" style="position:fixed;top:10px;right:10px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 13px monospace;padding:8px 12px;cursor:pointer">🌄 HDRi: off</button>
 <div id="fc" style="position:fixed;top:52px;right:10px;background:rgba(0,0,0,0.6);color:#ff0;font:bold 46px monospace;padding:6px 16px;border-radius:8px;display:none"></div>
@@ -852,6 +853,8 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
 // Places the volumetric performer on a real floor (hit-test) and renders the same splats from the phone's
 // pose, with a soft contact shadow. iOS Safari has no WebXR -> the button stays hidden (3D fallback only).
 // NOTE: written against the WebXR Device API spec; could not be run on a headset/phone here -> test on-device.
+const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fresh build from a cached one
+{ const _vb=document.getElementById('verBadge'); if(_vb) _vb.textContent='EWA Player '+AR_VERSION; }
 (function(){
   const arBtn=document.getElementById('arBtn'), arHint=document.getElementById('arHint');
   if(!('xr' in navigator)||!navigator.xr){ return; }
@@ -871,12 +874,34 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
   const shProg=mkProg(shVS,shFS);
   const shQuad=new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
   const shVbo=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,shVbo); gl.bufferData(gl.ARRAY_BUFFER,shQuad,gl.STATIC_DRAW);
+  // a floor RING (reuses the shadow VS for the floor-disc geometry) — used for the hit-test reticle + feet anchor
+  const ringFS=`#version 300 es
+    precision highp float; in vec2 vp2; out vec4 frag; uniform vec3 col; uniform float op;
+    void main(){ float r=length(vp2);
+      float a=smoothstep(0.60,0.80,r)*(1.0-smoothstep(0.86,1.0,r))*op;   // a thin bright band near r~0.85
+      if(a<0.01)discard; frag=vec4(col*a,a); }`;                          // premultiplied (blend = ONE, 1-srcA)
+  const ringProg=mkProg(shVS,ringFS);
+  // draw a flat ring on the floor at world `center`, radius `rad` (m), via the CAMERA view (not the model-view)
+  function drawFloorRing(center,rad,col,op,vc,fx,fy,ppx,ppy){
+    gl.useProgram(ringProg);
+    gl.bindBuffer(gl.ARRAY_BUFFER,shVbo); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+    gl.uniformMatrix4fv(gl.getUniformLocation(ringProg,'view'),false,vc);
+    gl.uniform2f(gl.getUniformLocation(ringProg,'focal'),fx,fy);
+    gl.uniform2f(gl.getUniformLocation(ringProg,'vp'),gl._w,gl._h); gl.uniform2f(gl.getUniformLocation(ringProg,'pp'),ppx,ppy);
+    gl.uniform3f(gl.getUniformLocation(ringProg,'base'),center[0],center[1],center[2]); gl.uniform1f(gl.getUniformLocation(ringProg,'rad'),rad);
+    gl.uniform3f(gl.getUniformLocation(ringProg,'col'),col[0],col[1],col[2]); gl.uniform1f(gl.getUniformLocation(ringProg,'op'),op);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  }
+  const RET_RAD=0.13, FEET_RAD=0.18;   // reticle + feet-ring radii (m)
 
   const TARGET_H=parseFloat(_qs.get('arh')??'1.7');   // real-world actor height (m)
   const ARYAW=parseFloat(_qs.get('aryaw')??'0');      // facing offset; set ?aryaw=3.14159 if the actor faces away
   let session=null, refSpace=null, hitSource=null, lightProbe=null;
   let placed=null, lastHit=null, lastCam=[0,0,0];
   let box=null, userScale=1, userYaw=0, placedYaw=0, arAmb=[1,1,1];
+  let hitNow=false, lastTouchMs=0, _hint='';   // hitNow = a floor hit exists this frame; lastTouchMs drives the feet-ring fade
+  function setHint(s){ if(arHint&&_hint!==s){_hint=s; arHint.textContent=s;} }
+  function feetOp(){ return Math.max(0,Math.min(1, 1-(performance.now()-lastTouchMs-3000)/700)); }   // full 3 s after a touch, then ~0.7 s fade
 
   // column-major 4x4 multiply: o = a*b
   function mul(a,b){const o=new Float32Array(16);
@@ -970,14 +995,17 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
     if(!box){ box=computeBox(); if(!box)return; }
     readLight(frame);
     const cm0=pose.views[0].transform.matrix; lastCam=[cm0[12],cm0[13],cm0[14]];
+    hitNow=false;
     if(hitSource){ const hits=frame.getHitTestResults(hitSource);
-      if(hits.length){ const hp=hits[0].getPose(refSpace); if(hp){ const p=hp.transform.position; lastHit=[p.x,p.y,p.z]; } } }
+      if(hits.length){ const hp=hits[0].getPose(refSpace); if(hp){ const p=hp.transform.position; lastHit=[p.x,p.y,p.z]; hitNow=true; } } }
+    if(!placed) setHint(hitNow ? ('Tap to place  ·  '+AR_VERSION) : ('Point your phone at the floor and move it slowly…  ·  '+AR_VERSION));
     const layer=session.renderState.baseLayer;
     gl.bindFramebuffer(gl.FRAMEBUFFER,layer.framebuffer);
     gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);   // transparent -> camera passthrough shows through
     gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.DEPTH_TEST);
     if(!G)return;
-    const pl=placed||lastHit||[lastCam[0],0,lastCam[2]-1.5];     // preview ~1.5 m ahead until the user taps to place
+    const pl=placed||lastHit;     // only render once a real surface exists (placed, or a current/previous floor hit) — no floating actor
+    if(pl){
     const yaw=(placed?placedYaw:faceYaw(lastCam,pl))+userYaw+ARYAW;
     const M=modelMatrix(pl,yaw);
     for(const view of pose.views){
@@ -987,34 +1015,41 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
       const pm=view.projectionMatrix;
       const fx=vp.width*0.5*pm[0], fy=vp.height*0.5*pm[5], ppx=pm[8], ppy=pm[9];
       drawSplatsXR(mv, vc, pl, eye, fx, fy, ppx, ppy);
+      // floor markers on top: cyan reticle on the detected surface while aiming, bright feet-ring after placement
+      if(placed){ const o=feetOp(); if(o>0.01) drawFloorRing(pl, FEET_RAD, [0.7,0.95,1.0], o, vc, fx,fy,ppx,ppy); }
+      else if(hitNow){ drawFloorRing(lastHit, RET_RAD, [0.25,0.9,1.0], 0.9, vc, fx,fy,ppx,ppy); }
+    }
     }
   }
   // pinch-to-scale + twist-to-yaw (dom-overlay touches, AR only)
   let _t0=null;
   function _ti(ts){ const a=ts[0],b=ts[1];
     return {d:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY), ang:Math.atan2(b.clientY-a.clientY,b.clientX-a.clientX)}; }
-  function onTouchStart(e){ if(session&&e.touches.length===2){ _t0=_ti(e.touches); _t0.s=userScale; _t0.y=userYaw; e.preventDefault(); } }
-  function onTouchMove(e){ if(session&&_t0&&e.touches.length===2){ const c=_ti(e.touches);
+  function onTouchStart(e){ if(!session)return; lastTouchMs=performance.now();   // any touch revives the feet-ring
+    if(e.touches.length===2){ _t0=_ti(e.touches); _t0.s=userScale; _t0.y=userYaw; e.preventDefault(); } }
+  function onTouchMove(e){ if(!session)return; lastTouchMs=performance.now();
+    if(_t0&&e.touches.length===2){ const c=_ti(e.touches);
     userScale=Math.max(0.2,Math.min(5.0,_t0.s*(c.d/Math.max(1,_t0.d)))); userYaw=_t0.y+(c.ang-_t0.ang); e.preventDefault(); } }
   function onTouchEnd(e){ if(e.touches.length<2)_t0=null; }
   async function enterAR(){
     try{
       await gl.makeXRCompatible();
       session=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['local-floor','dom-overlay','light-estimation'],domOverlay:{root:document.body}});
-      inXR=true; placed=null; lastHit=null; box=null; userScale=1; userYaw=0; arAmb=[1,1,1];
+      inXR=true; placed=null; lastHit=null; box=null; userScale=1; userYaw=0; arAmb=[1,1,1]; hitNow=false; lastTouchMs=0; _hint='';
       session.updateRenderState({baseLayer:new XRWebGLLayer(session,gl)});
       refSpace=await session.requestReferenceSpace('local-floor').catch(()=>session.requestReferenceSpace('local'));
       const viewerSpace=await session.requestReferenceSpace('viewer');
       try{ hitSource=await session.requestHitTestSource({space:viewerSpace}); }catch(e){ hitSource=null; }
       try{ lightProbe=await session.requestLightProbe(); }catch(e){ lightProbe=null; }
-      session.addEventListener('select',()=>{ const pl=lastHit||placed; if(pl){ placed=pl.slice(); placedYaw=faceYaw(lastCam,placed);
-        if(arHint) arHint.textContent='Placed. Pinch to resize, twist to turn, walk around.'; } });
+      session.addEventListener('select',()=>{ lastTouchMs=performance.now();
+        if(hitNow&&lastHit){ placed=lastHit.slice(); placedYaw=faceYaw(lastCam,placed);   // commit ONLY on a real floor hit
+          setHint('Placed  ·  pinch to resize · twist to turn · walk around  ·  '+AR_VERSION); } });
       session.addEventListener('end',()=>{ inXR=false; session=null; hitSource=null; lightProbe=null; arAmb=[1,1,1];
         gl.useProgram(prog); gl.uniform3f(gl.getUniformLocation(prog,'arAmb'),1,1,1);   // restore neutral relight for the 3D path
         window.removeEventListener('touchstart',onTouchStart); window.removeEventListener('touchmove',onTouchMove); window.removeEventListener('touchend',onTouchEnd);
         if(arHint)arHint.style.display='none'; if(arBtn)arBtn.style.display='block'; requestAnimationFrame(loop); });
       window.addEventListener('touchstart',onTouchStart,{passive:false}); window.addEventListener('touchmove',onTouchMove,{passive:false}); window.addEventListener('touchend',onTouchEnd);
-      if(arBtn) arBtn.style.display='none'; if(arHint){arHint.style.display='block'; arHint.textContent='Point at the floor, then tap to place.';}
+      if(arBtn) arBtn.style.display='none'; if(arHint)arHint.style.display='block'; setHint('Point your phone at the floor and move it slowly…  ·  '+AR_VERSION);
       // arm + sync the soundtrack (entering AR is a user gesture)
       audioStarted=true; hideSndHint(); if(snd.src){ syncAudio(); snd.play().catch(()=>{}); }
       session.requestAnimationFrame(onXRFrame);
