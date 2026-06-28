@@ -19,6 +19,14 @@ html,body{margin:0;height:100%;background:#000;color:#ccc;font:13px monospace;ov
 <button id="arBtn" style="position:fixed;left:50%;top:52px;transform:translateX(-50%);z-index:8;background:#0a7a4a;color:#fff;border:1px solid #1c9;border-radius:7px;font:bold 13px monospace;padding:10px 18px;cursor:pointer;display:none">📱 Enter AR</button>
 <div id="arHint" style="position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:10;background:#000c;color:#fff;border:1px solid #888;border-radius:8px;font:bold 13px monospace;padding:9px 16px;display:none">Move your phone to find the floor, then tap to place</div>
 <div id="verBadge" style="position:fixed;right:8px;bottom:8px;z-index:20;color:#9fb;opacity:0.55;font:bold 11px monospace;background:#0007;padding:3px 7px;border-radius:5px;pointer-events:none"></div>
+<style>#arCalib button{background:#1a1a1aee;color:#cfe;border:1px solid #5a7;border-radius:8px;font:bold 14px monospace;padding:11px 13px;cursor:pointer;pointer-events:auto}#arCalib button:active{background:#2a4a3a}#arCalib button.on{background:#2a6a4a;border-color:#7fc;color:#fff}</style>
+<div id="arDebug" style="position:fixed;left:8px;top:8px;z-index:16;display:none;color:#fd6;font:bold 11px monospace;background:#000a;padding:5px 8px;border-radius:6px;pointer-events:none;white-space:pre"></div>
+<div id="arCalib" style="position:fixed;left:0;right:0;bottom:0;z-index:15;display:none;flex-direction:column;align-items:center;gap:7px;padding:10px 8px;pointer-events:none">
+  <div id="arCalibRead" style="color:#9fb;font:bold 12px monospace;background:#000b;padding:5px 12px;border-radius:6px"></div>
+  <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:center;max-width:540px">
+    <button data-ar="yawm">⟲15°</button><button data-ar="yawp">15°⟳</button><button data-ar="mirror">Mirror</button><button data-ar="flip">Flip&nbsp;Up</button><button data-ar="face">Face&nbsp;Cam</button><button data-ar="scm">Scale&nbsp;−</button><button data-ar="scp">Scale&nbsp;+</button><button data-ar="dbg">🐞</button>
+  </div>
+</div>
 <select id="hdrSel" title="choose environment" style="position:fixed;top:10px;right:120px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 12px monospace;padding:8px 8px;cursor:pointer;max-width:200px"></select>
 <button id="hdrBtn" style="position:fixed;top:10px;right:10px;z-index:7;background:#222;color:#ccc;border:1px solid #666;border-radius:6px;font:bold 13px monospace;padding:8px 12px;cursor:pointer">🌄 HDRi: off</button>
 <div id="fc" style="position:fixed;top:52px;right:10px;background:rgba(0,0,0,0.6);color:#ff0;font:bold 46px monospace;padding:6px 16px;border-radius:8px;display:none"></div>
@@ -378,6 +386,7 @@ void main(){
   float mid=0.5*(a+c),r=sqrt(max(1e-6,mid*mid-(a*c-b2*b2)));
   float lam1=mid+r, lam2=max(mid-r,0.1);
   vec2 dir=(abs(b2)<1e-7&&a>=c)?vec2(1.0,0.0):normalize(vec2(b2,lam1-a));
+  lam1=min(lam1,lam2*100.0);   // cap MAJOR axis -> kill needle-spike outliers (aniso<=10) without softening round splats (aniso~4)
   float dx=dir.x,dy=dir.y;
   float A2=lam1*dx*dx+lam2*dy*dy, B2=(lam1-lam2)*dx*dy, C2=lam1*dy*dy+lam2*dx*dx;
   float det=A2*C2-B2*B2;
@@ -853,7 +862,7 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
 // Places the volumetric performer on a real floor (hit-test) and renders the same splats from the phone's
 // pose, with a soft contact shadow. iOS Safari has no WebXR -> the button stays hidden (3D fallback only).
 // NOTE: written against the WebXR Device API spec; could not be run on a headset/phone here -> test on-device.
-const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fresh build from a cached one
+const AR_VERSION='v1.4';   // bump on every AR change so the user can tell a fresh build from a cached one
 { const _vb=document.getElementById('verBadge'); if(_vb) _vb.textContent='EWA Player '+AR_VERSION; }
 (function(){
   const arBtn=document.getElementById('arBtn'), arHint=document.getElementById('arHint');
@@ -900,6 +909,26 @@ const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fre
   let placed=null, lastHit=null, lastCam=[0,0,0];
   let box=null, userScale=1, userYaw=0, placedYaw=0, arAmb=[1,1,1];
   let hitNow=false, lastTouchMs=0, _hint='';   // hitNow = a floor hit exists this frame; lastTouchMs drives the feet-ring fade
+  // --- on-device orientation calibration (the user converges it; persisted in the URL hash so a reload keeps it) ---
+  const _hp=new URLSearchParams(location.hash.slice(1));
+  let calibYaw=_hp.has('aryaw')?parseFloat(_hp.get('aryaw'))*Math.PI/180:ARYAW;   // facing offset (hash in degrees)
+  let mirror=_hp.get('armir')==='1', flipUp=_hp.get('arflip')==='1', faceCam=_hp.get('arface')!=='0';
+  let dbgOn=false, dbgFrame=0;
+  if(_hp.has('arscale')) userScale=Math.max(0.2,Math.min(5,parseFloat(_hp.get('arscale'))||1));
+  function _calibText(){ return 'yaw '+Math.round(calibYaw*180/Math.PI)+'°  mirror:'+(mirror?'on':'off')+'  flipUp:'+(flipUp?'on':'off')+'  face:'+(faceCam?'on':'off')+'  scale:'+userScale.toFixed(2); }
+  function _calibReadout(){ const r=document.getElementById('arCalibRead'); if(r)r.textContent=_calibText();
+    const set=(d,on)=>{const b=document.querySelector('#arCalib [data-ar="'+d+'"]'); if(b)b.classList.toggle('on',on);};
+    set('mirror',mirror); set('flip',flipUp); set('face',faceCam); set('dbg',dbgOn); }
+  function _calibApply(){ _calibReadout();
+    const dd=document.getElementById('arDebug'); if(dd)dd.style.display=dbgOn?'block':'none';
+    try{ history.replaceState(null,'','#aryaw='+Math.round(calibYaw*180/Math.PI)+'&armir='+(mirror?1:0)+'&arflip='+(flipUp?1:0)+'&arface='+(faceCam?1:0)+'&arscale='+userScale.toFixed(2)); }catch(e){} }
+  function _calibBtn(d){ const D=15*Math.PI/180;
+    if(d==='yawm')calibYaw-=D; else if(d==='yawp')calibYaw+=D;
+    else if(d==='mirror')mirror=!mirror; else if(d==='flip')flipUp=!flipUp; else if(d==='face')faceCam=!faceCam;
+    else if(d==='scm')userScale=Math.max(0.2,userScale/1.15); else if(d==='scp')userScale=Math.min(5,userScale*1.15);
+    else if(d==='dbg')dbgOn=!dbgOn;
+    _calibApply(); }
+  document.querySelectorAll('#arCalib [data-ar]').forEach(b=>b.addEventListener('click',e=>{e.stopPropagation(); _calibBtn(b.getAttribute('data-ar'));}));
   function setHint(s){ if(arHint&&_hint!==s){_hint=s; arHint.textContent=s;} }
   function feetOp(){ return Math.max(0,Math.min(1, 1-(performance.now()-lastTouchMs-3000)/700)); }   // full 3 s after a touch, then ~0.7 s fade
 
@@ -919,12 +948,15 @@ const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fre
   function curScale(){ return (TARGET_H/box.h)*userScale; }
   // M = T(pl)·Ry(yaw)·Scale(s)·T(-c): feet to the floor at pl, XZ-centered on pl, ~TARGET_H tall, yawed
   function modelMatrix(pl,yaw){
-    const s=curScale(), cs=Math.cos(yaw)*s, sn=Math.sin(yaw)*s;
-    const R=[cs,0,-sn, 0,s,0, sn,0,cs], c=[box.cx,box.feetY,box.cz];
-    const tx=pl[0]-(R[0]*c[0]+R[3]*c[1]+R[6]*c[2]);
-    const ty=pl[1]-(R[1]*c[0]+R[4]*c[1]+R[7]*c[2]);
-    const tz=pl[2]-(R[2]*c[0]+R[5]*c[1]+R[8]*c[2]);
-    return new Float32Array([R[0],R[1],R[2],0, R[3],R[4],R[5],0, R[6],R[7],R[8],0, tx,ty,tz,1]);
+    // M = T(pl)·T(0,-s·bottom,0)·s·Ry(yaw)·Mirror(mx)·FlipUp(fy,fz)·T(-cx,0,-cz); bottom recomputed after flip so feet stay on floor
+    const s=curScale(), mx=mirror?-1:1, fy=flipUp?-1:1, fz=flipUp?-1:1;
+    const co=Math.cos(yaw), si=Math.sin(yaw);
+    const r0=s*co*mx, r2=-s*si*mx, r4=s*fy, r6=s*si*fz, r8=s*co*fz;   // s·Ry·diag(mx,fy,fz) (col-major cols 0,1,2)
+    const yb=flipUp?-(box.feetY+box.h):box.feetY;                     // model bottom Y after the flip
+    const tx=pl[0]-(r0*box.cx+r6*box.cz);
+    const ty=pl[1]-s*yb;
+    const tz=pl[2]-(r2*box.cx+r8*box.cz);
+    return new Float32Array([r0,0,r2,0, 0,r4,0,0, r6,0,r8,0, tx,ty,tz,1]);
   }
   // camera world matrix -> renderer (+z-forward) view, NO model shift
   function camView(cm){
@@ -999,6 +1031,9 @@ const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fre
     if(hitSource){ const hits=frame.getHitTestResults(hitSource);
       if(hits.length){ const hp=hits[0].getPose(refSpace); if(hp){ const p=hp.transform.position; lastHit=[p.x,p.y,p.z]; hitNow=true; } } }
     if(!placed) setHint(hitNow ? ('Tap to place  ·  '+AR_VERSION) : ('Point your phone at the floor and move it slowly…  ·  '+AR_VERSION));
+    dbgFrame++;
+    if(dbgOn){ const dd=document.getElementById('arDebug');
+      if(dd) dd.textContent='f'+dbgFrame+'  cam '+lastCam[0].toFixed(2)+','+lastCam[1].toFixed(2)+','+lastCam[2].toFixed(2)+'\n'+(hitNow?'HIT':'scanning')+(placed?' · PLACED':' · not placed'); }
     const layer=session.renderState.baseLayer;
     gl.bindFramebuffer(gl.FRAMEBUFFER,layer.framebuffer);
     gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);   // transparent -> camera passthrough shows through
@@ -1006,7 +1041,8 @@ const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fre
     if(!G)return;
     const pl=placed||lastHit;     // only render once a real surface exists (placed, or a current/previous floor hit) — no floating actor
     if(pl){
-    const yaw=(placed?placedYaw:faceYaw(lastCam,pl))+userYaw+ARYAW;
+    const base=faceCam?(placed?placedYaw:faceYaw(lastCam,pl)):0;   // Face Cam off => actor keeps a fixed facing (calib only)
+    const yaw=base+userYaw+calibYaw;
     const M=modelMatrix(pl,yaw);
     for(const view of pose.views){
       const vp=layer.getViewport(view); gl.viewport(vp.x,vp.y,vp.width,vp.height); gl._w=vp.width; gl._h=vp.height;
@@ -1029,13 +1065,13 @@ const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fre
     if(e.touches.length===2){ _t0=_ti(e.touches); _t0.s=userScale; _t0.y=userYaw; e.preventDefault(); } }
   function onTouchMove(e){ if(!session)return; lastTouchMs=performance.now();
     if(_t0&&e.touches.length===2){ const c=_ti(e.touches);
-    userScale=Math.max(0.2,Math.min(5.0,_t0.s*(c.d/Math.max(1,_t0.d)))); userYaw=_t0.y+(c.ang-_t0.ang); e.preventDefault(); } }
+    userScale=Math.max(0.2,Math.min(5.0,_t0.s*(c.d/Math.max(1,_t0.d)))); userYaw=_t0.y+(c.ang-_t0.ang); _calibReadout(); e.preventDefault(); } }
   function onTouchEnd(e){ if(e.touches.length<2)_t0=null; }
   async function enterAR(){
     try{
       await gl.makeXRCompatible();
       session=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['local-floor','dom-overlay','light-estimation'],domOverlay:{root:document.body}});
-      inXR=true; placed=null; lastHit=null; box=null; userScale=1; userYaw=0; arAmb=[1,1,1]; hitNow=false; lastTouchMs=0; _hint='';
+      inXR=true; placed=null; lastHit=null; box=null; userYaw=0; arAmb=[1,1,1]; hitNow=false; lastTouchMs=0; _hint='';   // keep userScale + calib across sessions
       session.updateRenderState({baseLayer:new XRWebGLLayer(session,gl)});
       refSpace=await session.requestReferenceSpace('local-floor').catch(()=>session.requestReferenceSpace('local'));
       const viewerSpace=await session.requestReferenceSpace('viewer');
@@ -1047,9 +1083,11 @@ const AR_VERSION='v1.3';   // bump on every AR change so the user can tell a fre
       session.addEventListener('end',()=>{ inXR=false; session=null; hitSource=null; lightProbe=null; arAmb=[1,1,1];
         gl.useProgram(prog); gl.uniform3f(gl.getUniformLocation(prog,'arAmb'),1,1,1);   // restore neutral relight for the 3D path
         window.removeEventListener('touchstart',onTouchStart); window.removeEventListener('touchmove',onTouchMove); window.removeEventListener('touchend',onTouchEnd);
+        { const cp=document.getElementById('arCalib'); if(cp)cp.style.display='none'; const dd=document.getElementById('arDebug'); if(dd)dd.style.display='none'; }
         if(arHint)arHint.style.display='none'; if(arBtn)arBtn.style.display='block'; requestAnimationFrame(loop); });
       window.addEventListener('touchstart',onTouchStart,{passive:false}); window.addEventListener('touchmove',onTouchMove,{passive:false}); window.addEventListener('touchend',onTouchEnd);
       if(arBtn) arBtn.style.display='none'; if(arHint)arHint.style.display='block'; setHint('Point your phone at the floor and move it slowly…  ·  '+AR_VERSION);
+      { const cp=document.getElementById('arCalib'); if(cp)cp.style.display='flex'; _calibApply(); }   // show calibration panel
       // arm + sync the soundtrack (entering AR is a user gesture)
       audioStarted=true; hideSndHint(); if(snd.src){ syncAudio(); snd.play().catch(()=>{}); }
       session.requestAnimationFrame(onXRFrame);
