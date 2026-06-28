@@ -862,7 +862,7 @@ console.log('[mint] __mint render-state exposed. Load _renderdump.js then run me
 // Places the volumetric performer on a real floor (hit-test) and renders the same splats from the phone's
 // pose, with a soft contact shadow. iOS Safari has no WebXR -> the button stays hidden (3D fallback only).
 // NOTE: written against the WebXR Device API spec; could not be run on a headset/phone here -> test on-device.
-const AR_VERSION='v2.0 (three.js)';   // bump on every AR change so the user can tell a fresh build from a cached one
+const AR_VERSION='v2.1 (three.js)';   // bump on every AR change so the user can tell a fresh build from a cached one
 { const _vb=document.getElementById('verBadge'); if(_vb) _vb.textContent='EWA Player '+AR_VERSION; }
 (function(){
   const arBtn=document.getElementById('arBtn'), arHint=document.getElementById('arHint');
@@ -1184,6 +1184,8 @@ const AR_VERSION='v2.0 (three.js)';   // bump on every AR change so the user can
   }
   function initThree(){
     renderer=new THREE.WebGLRenderer({alpha:true,antialias:true});
+    renderer.outputColorSpace=THREE.LinearSRGBColorSpace;   // splat FS already outputs display-ready color (same as the 3D path) — no sRGB re-encode
+    renderer.toneMapping=THREE.NoToneMapping;                // and no tone-map; otherwise THREE double-processes -> over-saturated AR splats
     renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.5));
     renderer.setSize(window.innerWidth,window.innerHeight);
     renderer.xr.enabled=true;
